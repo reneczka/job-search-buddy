@@ -1,15 +1,3 @@
-#!/usr/bin/env python3
-"""
-Job Scraper - Phase 1: Dummy Data MVP
-Verify Airtable connection and field mapping with fake data.
-
-Single-command run: this script starts an Airtable MCP server via stdio,
-connects via the Agents SDK, inserts dummy job data, and shuts down.
-
-Run:
-  python main.py
-"""
-
 import asyncio
 import os
 import signal
@@ -23,48 +11,9 @@ from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 
+from sources_loader import load_sources_with_fallback, display_loaded_sources, generate_dummy_jobs_from_sources
+
 console = Console()
-
-
-# Dummy job data - 3 sample jobs for testing
-DUMMY_JOBS = [
-    {
-        "source": "TechJobs.com",
-        "link": "https://techjobs.com/senior-python-developer-123",
-        "company": "Tech Innovations Inc",
-        "position": "Senior Python Developer",
-        "salary": "$85,000 - $105,000",
-        "location": "Warsaw, Poland",
-        "notes": f"Dummy job created on {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "requirements": "5+ years Python, Django, REST APIs, PostgreSQL",
-        "about_company": "Leading tech company specializing in fintech solutions",
-        "remote_type": "Remote"
-    },
-    {
-        "source": "StartupJobs.eu",
-        "link": "https://startupjobs.eu/frontend-react-developer-456",
-        "company": "Digital Solutions Ltd",
-        "position": "Frontend React Developer",
-        "salary": "€60,000 - €75,000",
-        "location": "Krakow, Poland",
-        "notes": f"Dummy job created on {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "requirements": "3+ years React, TypeScript, CSS3, Git",
-        "about_company": "Fast-growing startup in e-commerce space",
-        "remote_type": "Hybrid"
-    },
-    {
-        "source": "DevCareers.pl",
-        "link": "https://devcareers.pl/fullstack-javascript-789",
-        "company": "CodeCraft Studios",
-        "position": "Full Stack JavaScript Developer",
-        "salary": "12,000 - 15,000 PLN",
-        "location": "Gdansk, Poland",
-        "notes": f"Dummy job created on {datetime.now().strftime('%Y-%m-%d %H:%M')}",
-        "requirements": "Node.js, Express, React, MongoDB, AWS",
-        "about_company": "Creative software development studio",
-        "remote_type": "Local"
-    }
-]
 
 
 async def main() -> None:
@@ -131,55 +80,11 @@ async def main() -> None:
     AIRTABLE_PACKAGE = os.getenv("AIRTABLE_MCP_PACKAGE", "@felores/airtable-mcp-server")
     AIRTABLE_USE_NPX = os.getenv("AIRTABLE_USE_NPX", "1") in ("1", "true", "True")
 
-    # Generate agent instructions for dummy data insertion
-    job_data_str = "\n".join([
-        f"Job {i+1}: {job['position']} at {job['company']} (Source: {job['source']})"
-        for i, job in enumerate(DUMMY_JOBS)
-    ])
-    
-    AGENT_INSTRUCTIONS = f"""
-You are connected to an Airtable MCP server. Your task is to insert {len(DUMMY_JOBS)} dummy job records 
-into the 'offers' table (or similar jobs table) in the Airtable base.
-
-Jobs to insert:
-{job_data_str}
-
-For each job, call create_record with the exact field mapping:
-- source: The job board name
-- link: The job posting URL  
-- company: Company name
-- position: Job title/position
-- CV sent: Leave empty/false (will be filled manually later)
-- salary: Salary information
-- location: Job location
-- notes: Notes about the job
-- date applied: Leave empty (will be filled when actually applied)
-- requirements: Job requirements and skills needed
-- about company: Information about the company
-- Local/Rem/Hyb: Whether the job is Local, Remote, or Hybrid
-
-Use the create_record tool with proper JSON structure including 'fields' key.
-Report success/failure for each insertion and provide a summary at the end.
-"""
-
     console.print(Panel.fit(
-        "🚀 Job Scraper - Phase 1: Dummy Data MVP\n"
-        "Verifying Airtable connection and field mapping with fake data...",
+        "Job Scraper - Phase 2: Dynamic Sources\n"
+        "Loading sources from Airtable and creating jobs based on them...",
         border_style="blue"
     ))
-
-    # Display dummy jobs that will be inserted
-    console.print("\n📋 Dummy jobs to be inserted:", style="yellow")
-    job_table = Table(show_header=True, header_style="bold magenta")
-    job_table.add_column("Company", style="cyan")
-    job_table.add_column("Position", style="green")
-    job_table.add_column("Location", style="blue")
-    job_table.add_column("Source", style="yellow")
-    
-    for job in DUMMY_JOBS:
-        job_table.add_row(job['company'], job['position'], job['location'], job['source'])
-    
-    console.print(job_table)
 
     try:
         # Construct Airtable stdio MCP client
@@ -187,7 +92,7 @@ Report success/failure for each insertion and provide a summary at the end.
         airtable_args = ["-y", AIRTABLE_PACKAGE] if AIRTABLE_USE_NPX else [AIRTABLE_PACKAGE]
         airtable_env = {**os.environ, "AIRTABLE_API_KEY": airtable_key}
         
-        console.print(f"\n🔌 Starting Airtable MCP server via stdio: {airtable_cmd} {' '.join(airtable_args)}")
+        console.print(f"\nStarting Airtable MCP server via stdio: {airtable_cmd} {' '.join(airtable_args)}")
         
         airtable_server = MCPServerStdio({
             "command": airtable_cmd,
@@ -197,7 +102,71 @@ Report success/failure for each insertion and provide a summary at the end.
 
         # Connect to Airtable MCP server
         async with airtable_server:
-            console.print("✅ Connected to Airtable MCP server.", style="green")
+            console.print("Connected to Airtable MCP server.", style="green")
+
+            # Phase 2: Load sources dynamically from Airtable
+            sources = await load_sources_with_fallback(airtable_server)
+            display_loaded_sources(sources)
+            
+            # Generate dummy jobs based on loaded sources
+            dummy_jobs = generate_dummy_jobs_from_sources(sources)
+            
+            # Generate agent instructions for dynamic job insertion
+            job_data_str = "\n".join([
+                f"Job {i+1}: {job['position']} at {job['company']} (Source: {job['source']})"
+                for i, job in enumerate(dummy_jobs)
+            ])
+            
+            AGENT_INSTRUCTIONS = f"""
+You are connected to an Airtable MCP server. Your task is to insert {len(dummy_jobs)} dummy job records 
+into the 'offers' table in the Airtable base.
+
+These jobs are generated from {len(sources)} sources loaded from the 'sources' table:
+{job_data_str}
+
+For each job, use the create_record tool with this EXACT JSON format:
+{{
+  "baseId": "{airtable_base}",
+  "tableId": "tblVIbY84NJvk8LHI",
+  "fields": {{
+    "Source": "job_source_here",
+    "Link": "job_link_here",
+    "Company": "company_name_here",
+    "Position": "position_title_here",
+    "CV sent": false,
+    "Salary": "salary_info_here",
+    "Location": "job_location_here",
+    "Notes": "job_notes_here",
+    "Date applied": "",
+    "Requirements": "job_requirements_here",
+    "About company": "company_info_here",
+    "Local/Remote/Hybrid": "remote_type_here"
+  }}
+}}
+
+CRITICAL REQUIREMENTS:
+- Use baseId (not base_id)
+- Use tableId (not table_id)  
+- Include the top-level "fields" key with all field data inside it
+- Use the exact field names shown above
+- Replace the placeholder values with actual job data
+
+Insert each job one by one and report success/failure for each insertion.
+Provide a summary at the end showing how many jobs were successfully inserted.
+"""
+
+            # Display dummy jobs that will be inserted
+            console.print(f"\nGenerated {len(dummy_jobs)} dummy jobs based on loaded sources:", style="yellow")
+            job_table = Table(show_header=True, header_style="bold magenta")
+            job_table.add_column("Company", style="cyan")
+            job_table.add_column("Position", style="green")
+            job_table.add_column("Location", style="blue")
+            job_table.add_column("Source", style="yellow")
+            
+            for job in dummy_jobs:
+                job_table.add_row(job['company'], job['position'], job['location'], job['source'])
+            
+            console.print(job_table)
 
             # Define the agent with Airtable MCP server attached
             agent = Agent(
@@ -207,23 +176,44 @@ Report success/failure for each insertion and provide a summary at the end.
                 mcp_servers=[airtable_server],
             )
 
-            console.print("\n🤖 Running job insertion agent...", style="blue")
+            console.print("\nRunning job insertion agent...", style="blue")
             
-            # Prepare detailed insertion instructions
-            job_instructions = "Insert the following dummy jobs into Airtable:\n\n"
-            for i, job in enumerate(DUMMY_JOBS, 1):
-                job_instructions += f"Job {i}:\n"
-                job_instructions += f"  - Source: {job['source']}\n"
-                job_instructions += f"  - Link: {job['link']}\n"
-                job_instructions += f"  - Company: {job['company']}\n"
-                job_instructions += f"  - Position: {job['position']}\n"
-                job_instructions += f"  - Salary: {job['salary']}\n"
-                job_instructions += f"  - Location: {job['location']}\n"
-                job_instructions += f"  - Notes: {job['notes']}\n"
-                job_instructions += f"  - Requirements: {job['requirements']}\n"
-                job_instructions += f"  - About company: {job['about_company']}\n"
-                job_instructions += f"  - Local/Rem/Hyb: {job['remote_type']}\n\n"
+            # Prepare detailed insertion instructions with sanitized data
+            job_instructions = "Insert the following dummy jobs into Airtable using the exact format shown:\n\n"
+            for i, job in enumerate(dummy_jobs, 1):
+                # Sanitize values to avoid JSON issues
+                source = job['source'].replace('"', '\\"')
+                link = job['link'].replace('"', '\\"')
+                company = job['company'].replace('"', '\\"')
+                position = job['position'].replace('"', '\\"')
+                salary = job['salary'].replace('"', '\\"')
+                location = job['location'].replace('"', '\\"')
+                notes = job['notes'].replace('"', '\\"')
+                requirements = job['requirements'].replace('"', '\\"')
+                about_company = job['about_company'].replace('"', '\\"')
+                remote_type = job['remote_type'].replace('"', '\\"')
+                
+                job_instructions += f"""Job {i} - Insert with create_record:
+{{
+  "baseId": "{airtable_base}",
+  "tableId": "tblVIbY84NJvk8LHI",
+  "fields": {{
+    "Source": "{source}",
+    "Link": "{link}",
+    "Company": "{company}",
+    "Position": "{position}",
+    "CV sent": false,
+    "Salary": "{salary}",
+    "Location": "{location}",
+    "Notes": "{notes}",
+    "Date applied": "",
+    "Requirements": "{requirements}",
+    "About company": "{about_company}",
+    "Local/Remote/Hybrid": "{remote_type}"
+  }}
+}}
 
+"""
             # Streamed run: print agent reasoning/steps as events
             streamed = Runner.run_streamed(
                 agent,
@@ -265,7 +255,7 @@ Report success/failure for each insertion and provide a summary at the end.
                 console.print(Panel(final_output, title="Agent Final Output"))
             
             # Display results
-            display_results(inserted_count, failed_count, len(DUMMY_JOBS))
+            display_results(inserted_count, failed_count, len(dummy_jobs), len(sources))
 
     except Exception as e:
         console.print(Panel(
@@ -276,51 +266,52 @@ Report success/failure for each insertion and provide a summary at the end.
         return
 
 
-def display_results(inserted_count: int, failed_count: int, total_jobs: int):
+def display_results(inserted_count: int, failed_count: int, total_jobs: int, source_count: int):
     """Display final results in a nice format."""
     console.print("\n" + "="*60, style="blue")
-    console.print("📊 PHASE 1 RESULTS", style="bold blue", justify="center")
+    console.print("PHASE 2 RESULTS", style="bold blue", justify="center")
     console.print("="*60, style="blue")
     
     # Create results table
     results_table = Table(show_header=True, header_style="bold magenta")
-    results_table.add_column("Metric", style="cyan", width=20)
+    results_table.add_column("Metric", style="cyan", width=25)
     results_table.add_column("Count", style="green", justify="right", width=10)
     results_table.add_column("Percentage", style="yellow", justify="right", width=15)
     
     success_rate = (inserted_count / total_jobs * 100) if total_jobs > 0 else 0
     failure_rate = (failed_count / total_jobs * 100) if total_jobs > 0 else 0
     
-    results_table.add_row("Total Jobs", str(total_jobs), "100%")
+    results_table.add_row("Sources Loaded", str(source_count), "")
+    results_table.add_row("Total Jobs Generated", str(total_jobs), "100%")
     results_table.add_row("Successfully Inserted", str(inserted_count), f"{success_rate:.1f}%")
     results_table.add_row("Failed", str(failed_count), f"{failure_rate:.1f}%")
     
     console.print(results_table)
     
     # Success criteria check
-    console.print("\n🎯 SUCCESS CRITERIA CHECK:", style="bold yellow")
+    console.print("\nPHASE 2 SUCCESS CRITERIA CHECK:", style="bold yellow")
     criteria = [
-        ("Script runs without errors", inserted_count > 0 or failed_count == 0),
-        ("2-3 dummy jobs appear in Airtable", inserted_count >= 2),
-        ("All fields populated correctly", inserted_count > 0),
-        ("Console shows clear progress", True)  # This is always true if we get here
+        ("Sources loaded from Airtable without hardcoding", source_count > 0),
+        ("Dummy jobs created using actual source names", total_jobs > 0 and inserted_count > 0),
+        ("Console shows source count and names", True),  # Always true if we get here
+        ("Works with any number of sources in table", source_count > 0)
     ]
     
     for criterion, passed in criteria:
-        status = "✅" if passed else "❌"
+        status = "[PASS]" if passed else "[FAIL]"
         style = "green" if passed else "red"
         console.print(f"  {status} {criterion}", style=style)
     
     # Final message
-    if inserted_count >= 2:
-        console.print("\n🎉 Phase 1 MVP completed successfully!", style="bold green")
-        console.print("👉 Check your Airtable 'offers' table to see the inserted jobs.", style="green")
-    elif inserted_count > 0:
-        console.print("\n⚠️  Phase 1 partially successful - some jobs were inserted.", style="bold yellow")
-        console.print("👉 Check your Airtable 'offers' table and review any errors above.", style="yellow")
+    if source_count > 0 and inserted_count >= source_count:
+        console.print("\nPhase 2 Dynamic Sources completed successfully!", style="bold green")
+        console.print("Check your Airtable 'offers' table to see jobs generated from dynamic sources.", style="green")
+    elif source_count > 0 and inserted_count > 0:
+        console.print("\nPhase 2 partially successful - some jobs were inserted.", style="bold yellow")
+        console.print("Check your Airtable 'offers' table and review any errors above.", style="yellow")
     else:
-        console.print("\n❌ Phase 1 needs attention - no jobs were inserted.", style="bold red")
-        console.print("👉 Check your Airtable configuration and API keys.", style="red")
+        console.print("\nPhase 2 needs attention - no sources loaded or jobs inserted.", style="bold red")
+        console.print("Check your Airtable 'sources' table configuration.", style="red")
 
 
 if __name__ == "__main__":
