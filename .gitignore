@@ -177,3 +177,5 @@ logs/
 
 
 src/openai-agents
+
+tests/
