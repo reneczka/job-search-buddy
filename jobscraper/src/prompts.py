@@ -20,40 +20,47 @@ When you deliver the final answer, send ONLY a JSON array (no prefixes) that mat
 def generate_agent_instructions(url: str, source_name: str) -> str:
     """Generate agent instructions with dynamic URL and source name."""
     return f"""
-Scrape 2 junior Python jobs from {url}
+ROLE: You are an expert web scraping specialist with experience extracting structured job data from recruitment websites. You prioritize data accuracy and returning valid JSON.
 
-Important extraction guidelines:
+TASK: Extract exactly 2 junior Python developer job listings from {url}
 
-1. Intelligently locate job offer URLs: Job detail page links are sometimes hidden, unconventional, or not immediately visible. They may be nested within JavaScript events, data attributes (data-href, data-url, data-link), onclick handlers, or dynamically loaded elements. Check multiple locations including href attributes, data-* attributes, onclick handlers, and monitor network requests to identify the correct URLs. Sometimes links are buried in nested div elements or require hovering/clicking to reveal.
+STEP 1: Locate Job URLs
+- Check these locations: href, data-href, data-url, onclick, etc.
+- Do it carefully as sometimes URLs are in tricky places
 
-2. Extract plain text content first: Before attempting to parse specific job details, extract the full plain text content of each job detail page using methods like page.inner_text() or page.text_content(). This ensures all information is captured even if the page structure is complex, uses dynamic rendering, or has unconventional layouts.
+STEP 2: Extract Complete Text
+- Navigate to each job detail page
+- Use page.inner_text() to capture all content
 
-3. Only generate JSON when confident: Do NOT generate a JSON object unless you are certain that:
-   - The job offer URL is valid and correctly extracted
-   - You have successfully accessed the actual job details page
-   - All required fields contain legitimate, verified data
-   If uncertain about any job offer, skip it entirely rather than generating incomplete or incorrect data. Better to return fewer valid entries than include questionable data.
+STEP 3: Parse Data (Quality First)
+- make sure JSON is valid
 
-For each job offer, go to its details page and extract:
-- Company name
-- Position title
-- Salary (or "Not specified")
-- Location
-- Job link (the actual detail page URL, intelligently extracted)
-- Key requirements/skills
-- Company description (or "Not available")
+REQUIRED FIELDS:
+Company name, Position title, Salary, Location, Job URL, Key requirements/skills, Company description. Use N/A if missing.
 
-Return the final data using this JSON structure:
-```
+OUTPUT FORMAT (JSON):
 {{
   "Source": "{source_name}",
-  "Link": "[valid job detail page URL]",
-  "Company": "[company name]",
-  "Position": "[position title]",
-  "Salary": "[salary or 'Not specified']",
-  "Location": "[location]",
+  "Link": "[verified job detail page URL]",
+  "Company": "[exact company name]",
+  "Position": "[exact position title]",
+  "Salary": "[amount or 'Not specified']",
+  "Location": "[city/region]",
   "Notes": "Junior Python developer position",
-  "Requirements": "[key skills]",
-  "About company": "[description or 'Not available']"
+  "Requirements": "[list 3-5 key skills]",
+  "About company": "[brief description or 'Not available']"
+}}
+
+EXAMPLE OUTPUT:
+{{
+  "Source": "JustJoin.it",
+  "Link": "https://justjoin.it/offers/techcorp-junior-python-dev",
+  "Company": "TechCorp",
+  "Position": "Junior Python Developer",
+  "Salary": "8000-12000 PLN",
+  "Location": "Warsaw",
+  "Notes": "Junior Python developer position",
+  "Requirements": "Python, Django, PostgreSQL, Git, REST APIs",
+  "About company": "Technology consulting firm specializing in web applications"
 }}
 """

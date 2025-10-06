@@ -89,7 +89,7 @@ class AirtableClient:
             ) from exc
 
         table = Table(self.config.api_key, self.config.base_id, table_id)
-        return table.all()
+        return table.all(sort=[{"field": "Job Boards", "direction": "desc"}])
 
     @staticmethod
     def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:

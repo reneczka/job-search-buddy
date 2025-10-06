@@ -4,6 +4,7 @@ OpenAI Agents SDK + Playwright MCP POC with optional Airtable syncing.
 
 import asyncio
 import json
+
 from rich.console import Console
 from rich.panel import Panel
 
@@ -12,7 +13,7 @@ from config import DEFAULT_DELAY_BETWEEN_SOURCES
 from environment_setup import validate_and_setup_environment
 from server_manager import create_playwright_server
 from agent_runner import create_playwright_agent, run_agent_with_task
-from prompts import NARRATIVE_INSTRUCTIONS, generate_agent_instructions, FALLBACK_TASK_PROMPT
+from prompts import NARRATIVE_INSTRUCTIONS, generate_agent_instructions
 from airtable_client import AirtableClient, AirtableConfig
 
 console = Console()
@@ -48,6 +49,9 @@ async def main() -> None:
         sources = client.get_all_records(sources_table_id)
 
         console.print(Panel(f"Fetched {len(sources)} sources from Airtable.", title="Sources", style="blue"))
+
+        for i, source_record in enumerate(sources, start=1):
+            console.print(Panel(f"{i}. {json.dumps(source_record, indent=4)}", title="Source", style="blue"))
 
         if not sources:
             console.print(Panel(
