@@ -8,12 +8,14 @@ Handles agent creation, configuration, and execution:
 """
 
 import asyncio
+import json
 import os
 import random
 from collections import deque
 from typing import Optional, List, Any, Deque
 from rich.console import Console
 from rich.panel import Panel
+from rich.text import Text
 from openai.types.shared import Reasoning, reasoning_effort
 
 from config import (
@@ -24,10 +26,52 @@ from config import (
     RATE_LIMIT_JITTER_SECONDS,
     RATE_LIMIT_REQUESTS_PER_MINUTE,
     RATE_LIMIT_WINDOW_SECONDS,
+    VERBOSE_MCP_LOGGING,
+    VERBOSE_AGENT_DECISIONS,
 )
 from prompts import NARRATIVE_INSTRUCTIONS
 
 console = Console()
+
+
+def _format_debug_data(data: Any) -> Optional[str]:
+    """Best-effort pretty-print for tool arguments/results."""
+    if data is None:
+        return None
+    try:
+        return json.dumps(data, indent=2, ensure_ascii=False)
+    except TypeError:
+        if hasattr(data, "model_dump") and callable(getattr(data, "model_dump")):
+            try:
+                return json.dumps(data.model_dump(), indent=2, ensure_ascii=False)
+            except Exception:
+                pass
+        if hasattr(data, "__dict__"):
+            try:
+                serializable = {
+                    key: value
+                    for key, value in data.__dict__.items()
+                    if not callable(value) and not key.startswith("_")
+                }
+                return json.dumps(serializable, indent=2, ensure_ascii=False, default=str)
+            except Exception:
+                pass
+        return repr(data)
+
+
+def _extract_name(*candidates: Any, default: str = "unknown") -> str:
+    for candidate in candidates:
+        if not candidate:
+            continue
+        if isinstance(candidate, str):
+            stripped = candidate.strip()
+            if stripped:
+                return stripped
+        if hasattr(candidate, "name"):
+            name = getattr(candidate, "name")
+            if isinstance(name, str) and name.strip():
+                return name.strip()
+    return default
 
 
 class AsyncRateLimiter:
@@ -124,7 +168,7 @@ class AgentRunner:
 
         streamed = Runner.run_streamed(agent, input=input_text, max_turns=max_turns)
         self._last_displayed_message = None
-        self.console.print(Panel(input_text, title="User", style="magenta"))
+        self.console.print(Panel(Text(input_text), title="User", style="magenta"))
         async for event in streamed.stream_events():
             await self._handle_stream_event(event)
 
@@ -155,102 +199,143 @@ class AgentRunner:
         raise RuntimeError("OpenAI rate limit retries exhausted") from last_error
 
     async def _handle_stream_event(self, event: Any) -> None:
-        """Handle stream events"""
-        if event.type == "run_item_stream_event" and event.item.type == "message_output_item":
-            try:
-                from agents import ItemHelpers
-                text = ItemHelpers.text_message_output(event.item)
-                cleaned_text = self._sanitize_agent_output(text)
-                if cleaned_text and cleaned_text != self._last_displayed_message:
-                    self.console.print(Panel(cleaned_text, title="Agent", style="green"))
-                    self._last_displayed_message = cleaned_text
-            except Exception:
-                pass
+        """Handle stream events with verbose logging for MCP activity."""
+        try:
+            event_type = getattr(event, "type", "unknown")
 
-    @staticmethod
-    def _sanitize_agent_output(text: str) -> str:
-        """Remove verbose code snippets while keeping conversational content."""
-        if not text:
-            return ""
+            if event_type == "run_item_stream_event":
+                item = getattr(event, "item", None)
+                item_type = getattr(item, "type", "unknown")
 
-        def is_code_like(line: str) -> bool:
-            stripped = line.strip()
-            if not stripped:
-                return False
-            if stripped.startswith("│"):
-                return True
+                if item_type == "message_output_item":
+                    from agents import ItemHelpers
 
-            lower = stripped.lower()
-            code_tokens = (
-                "const ",
-                "let ",
-                "var ",
-                "function",
-                "class ",
-                "return ",
-                " document.",
-                "queryselector",
-                "if (",
-                "else",
-                "while (",
-                "for (",
-                "=>",
-            )
-            if any(token in lower for token in code_tokens):
-                return True
+                    text = ItemHelpers.text_message_output(item)
+                    if text and text != self._last_displayed_message:
+                        self.console.print(Panel(Text(text), title="Agent", style="green"))
+                        self._last_displayed_message = text
 
-            symbol_density = sum(ch in "{}();<>[]#=+-*/\\|" for ch in stripped) / max(len(stripped), 1)
-            return symbol_density > 0.25
+                    if not VERBOSE_AGENT_DECISIONS:
+                        return
 
-        sanitized_lines = []
-        code_buffer = []
-        in_code_fence = False
+                if not VERBOSE_MCP_LOGGING:
+                    return
 
-        def flush_code_buffer() -> None:
-            if not code_buffer:
-                return
-            if len(code_buffer) > 1:
-                sanitized_lines.append("[code snippet omitted]")
-            else:
-                sanitized_lines.extend(code_buffer)
-            code_buffer.clear()
+                elif item_type == "tool_call_item":
+                    tool_name = _extract_name(
+                        getattr(item, "tool_name", None),
+                        getattr(item, "tool", None),
+                        getattr(item, "name", None),
+                        default="unknown tool",
+                    )
+                    server_name = _extract_name(
+                        getattr(item, "server_name", None),
+                        getattr(item, "server", None),
+                        getattr(getattr(item, "tool", None), "server_name", None),
+                        default="unknown server",
+                    )
+                    arguments = getattr(item, "arguments", None)
+                    formatted_args = _format_debug_data(arguments)
 
-        for line in text.splitlines():
-            stripped = line.strip()
+                    body_lines = [
+                        f"🔧 Tool call: {tool_name}",
+                        f"MCP Server: {server_name}",
+                        "Arguments:",
+                        formatted_args or "(none)",
+                    ]
+                    if tool_name == "unknown tool" or server_name == "unknown server":
+                        raw_item = _format_debug_data(item)
+                        if raw_item:
+                            body_lines.extend(["Raw item:", raw_item])
+                    self.console.print(Panel(Text("\n".join(body_lines)), title="MCP Tool Call", style="cyan"))
 
-            if stripped.startswith("```"):
-                if in_code_fence:
-                    flush_code_buffer()
-                in_code_fence = not in_code_fence
-                continue
+                elif item_type == "tool_result_item":
+                    tool_name = _extract_name(
+                        getattr(item, "tool_name", None),
+                        getattr(item, "tool", None),
+                        getattr(item, "name", None),
+                        default="unknown tool",
+                    )
+                    server_name = _extract_name(
+                        getattr(item, "server_name", None),
+                        getattr(item, "server", None),
+                        getattr(getattr(item, "tool", None), "server_name", None),
+                        default="unknown server",
+                    )
+                    output = getattr(item, "output", None)
+                    formatted_output = _format_debug_data(output)
 
-            if in_code_fence:
-                code_buffer.append(line)
-                continue
+                    body_lines = [
+                        f"✅ Tool result: {tool_name}",
+                        f"MCP Server: {server_name}",
+                        "Output:",
+                        formatted_output or "(empty)",
+                    ]
+                    if tool_name == "unknown tool" or server_name == "unknown server":
+                        raw_item = _format_debug_data(item)
+                        if raw_item:
+                            body_lines.extend(["Raw item:", raw_item])
+                    self.console.print(Panel(Text("\n".join(body_lines)), title="MCP Tool Result", style="green"))
 
-            if is_code_like(line):
-                code_buffer.append(line)
-                continue
+                elif item_type == "tool_call_output_item":
+                    output = getattr(item, "output", None)
+                    formatted_output = _format_debug_data(output)
+                    raw_item = _format_debug_data(item)
+                    body_lines = [
+                        "📤 Tool call output chunk",
+                        "Output:",
+                        formatted_output or "(empty)",
+                    ]
+                    if raw_item:
+                        body_lines.extend(["Raw item:", raw_item])
+                    self.console.print(Panel(Text("\n".join(body_lines)), title="MCP Tool Output", style="magenta"))
 
-            flush_code_buffer()
-            sanitized_lines.append(line)
+                elif item_type == "task_error_item":
+                    error_message = getattr(item, "error_message", "Unknown error")
+                    detail = _format_debug_data(getattr(item, "error", None))
 
-        flush_code_buffer()
+                    body_lines = [f"Error: {error_message}"]
+                    if detail:
+                        body_lines.extend(["Details:", detail])
 
-        return "\n".join(line for line in sanitized_lines if line.strip()).strip()
+                    self.console.print(Panel(Text("\n".join(body_lines)), title="MCP Error", style="red"))
 
-    
-    
+                elif item_type == "reasoning_item":
+                    if not VERBOSE_AGENT_DECISIONS:
+                        return
+                    reasoning = _format_debug_data(getattr(item, "content", None))
+                    raw_item = _format_debug_data(item)
+                    body_lines = ["🧠 Reasoning", reasoning or "(empty)"]
+                    if raw_item:
+                        body_lines.extend(["Raw item:", raw_item])
+                    self.console.print(Panel(Text("\n".join(body_lines)), title="Agent Reasoning", style="yellow"))
+
+                else:
+                    self.console.print(Panel(Text(f"Unhandled run item type: {item_type}"), title="MCP Event", style="magenta"))
+
+            elif event_type == "agent_updated_stream_event":
+                if not VERBOSE_MCP_LOGGING:
+                    return
+                new_agent = getattr(event, "new_agent", None)
+                agent_name = _extract_name(new_agent, default="unknown agent")
+                self.console.print(Panel(Text(f"Agent updated: {agent_name}"), title="Agent Update", style="yellow"))
+
+            elif event_type == "run_step_created_event":
+                if not VERBOSE_MCP_LOGGING:
+                    return
+                step = getattr(event, "step", None)
+                step_type = getattr(step, "type", "unknown")
+                self.console.print(Panel(Text(f"Step created: {step_type}"), title="Run Step", style="blue"))
+
+        except Exception as exc:
+            self.console.print(Panel(Text(f"Stream event handling error: {exc}"), title="Stream Error", style="red"))
+
     def display_final_result(self, result: Any) -> None:
         """Display final result"""
         final_output: Optional[str] = getattr(result, "final_output", None)
-        if final_output:
-            cleaned_text = self._sanitize_agent_output(final_output)
-            text_to_display = cleaned_text if cleaned_text else final_output
-            if text_to_display and text_to_display != self._last_displayed_message:
-                self.console.print(Panel(text_to_display, title="Final Output"))
-                self._last_displayed_message = text_to_display
-
+        if final_output and final_output != self._last_displayed_message:
+            self.console.print(Panel(Text(final_output), title="Final Output", style="green"))
+            self._last_displayed_message = final_output
 
 def create_playwright_agent(playwright_server: Any) -> Any:
     """Create agent configured with the Playwright MCP server."""

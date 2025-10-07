@@ -20,7 +20,7 @@ from airtable_client import AirtableClient, AirtableConfig
 HARDCODED_SOURCE_URL = (
     "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
 )
-USE_HARDCODED_SOURCE = True
+USE_HARDCODED_SOURCE = False
 
 console = Console()
 

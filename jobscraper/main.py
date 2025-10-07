@@ -139,7 +139,7 @@ For each job, use the create_record tool with this EXACT JSON format:
     "Notes": "job_notes_here",
     "Date applied": "",
     "Requirements": "job_requirements_here",
-    "About company": "company_info_here",
+    "Company description": "company_info_here",
     "Local/Remote/Hybrid": "remote_type_here"
   }}
 }}
@@ -208,7 +208,7 @@ Provide a summary at the end showing how many jobs were successfully inserted.
     "Notes": "{notes}",
     "Date applied": "",
     "Requirements": "{requirements}",
-    "About company": "{about_company}",
+    "Company description": "{about_company}",
     "Local/Remote/Hybrid": "{remote_type}"
   }}
 }}
