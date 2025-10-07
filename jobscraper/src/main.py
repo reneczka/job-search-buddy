@@ -16,6 +16,12 @@ from agent_runner import create_playwright_agent, run_agent_with_task
 from prompts import NARRATIVE_INSTRUCTIONS, generate_agent_instructions
 from airtable_client import AirtableClient, AirtableConfig
 
+
+HARDCODED_SOURCE_URL = (
+    "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
+)
+USE_HARDCODED_SOURCE = True
+
 console = Console()
 
 
@@ -25,41 +31,56 @@ async def main() -> None:
         # Validate environment and setup
         validate_and_setup_environment()
 
-        airtable_config = AirtableConfig.from_env()
-        airtable_enabled = airtable_config.is_configured()
-
-        if not airtable_enabled:
+        if USE_HARDCODED_SOURCE:
+            sources = [
+                {
+                    "fields": {
+                        "Job Boards": HARDCODED_SOURCE_URL,
+                    }
+                }
+            ]
+            client = None
             console.print(Panel(
-                "Airtable not configured. Cannot fetch sources.",
-                title="Error",
-                style="red",
+                "Using hardcoded job source.",
+                title="Sources",
+                style="blue",
             ))
-            return
+        else:
+            airtable_config = AirtableConfig.from_env()
+            airtable_enabled = airtable_config.is_configured()
 
-        # Fetch sources from Airtable
-        client = AirtableClient(airtable_config)
-        sources_table_id = airtable_config.sources_table_id
-        if not sources_table_id:
-            console.print(Panel(
-                "AIRTABLE_SOURCES_TABLE_ID not set in environment.",
-                title="Error",
-                style="red",
-            ))
-            return
-        sources = client.get_all_records(sources_table_id)
+            if not airtable_enabled:
+                console.print(Panel(
+                    "Airtable not configured. Cannot fetch sources.",
+                    title="Error",
+                    style="red",
+                ))
+                return
 
-        console.print(Panel(f"Fetched {len(sources)} sources from Airtable.", title="Sources", style="blue"))
+            # Fetch sources from Airtable
+            client = AirtableClient(airtable_config)
+            sources_table_id = airtable_config.sources_table_id
+            if not sources_table_id:
+                console.print(Panel(
+                    "AIRTABLE_SOURCES_TABLE_ID not set in environment.",
+                    title="Error",
+                    style="red",
+                ))
+                return
+            sources = client.get_all_records(sources_table_id)
 
-        for i, source_record in enumerate(sources, start=1):
-            console.print(Panel(f"{i}. {json.dumps(source_record, indent=4)}", title="Source", style="blue"))
+            console.print(Panel(f"Fetched {len(sources)} sources from Airtable.", title="Sources", style="blue"))
 
-        if not sources:
-            console.print(Panel(
-                "No sources found in Airtable.",
-                title="Warning",
-                style="yellow",
-            ))
-            return
+            for i, source_record in enumerate(sources, start=1):
+                console.print(Panel(f"{i}. {json.dumps(source_record, indent=4)}", title="Source", style="blue"))
+
+            if not sources:
+                console.print(Panel(
+                    "No sources found in Airtable.",
+                    title="Warning",
+                    style="yellow",
+                ))
+                return
 
         all_records = []
 
@@ -95,7 +116,14 @@ async def main() -> None:
 
         # Sync all results to Airtable offers table
         if all_records:
-            client.create_records(all_records)
+            if client:
+                client.create_records(all_records)
+            else:
+                console.print(Panel(
+                    "Skipping Airtable sync because hardcoded mode is enabled.",
+                    title="Airtable",
+                    style="yellow",
+                ))
         else:
             console.print(Panel(
                 "No records to add to Airtable.",
@@ -104,12 +132,25 @@ async def main() -> None:
             ))
 
     except Exception as e:
-        console.print(f"Application error: {e}")
+        console.print(Panel(
+            f"Application error ({type(e).__name__}): {e}",
+            title="Error",
+            style="red",
+        ))
+        console.print_exception(show_locals=False)
         raise
 
 
 def _parse_records(output_text: str):
     if not output_text:
+        return None
+
+    if not isinstance(output_text, str):
+        console.print(Panel(
+            f"Unexpected agent output type: {type(output_text).__name__}",
+            title="Parse Error",
+            style="red",
+        ))
         return None
 
     stripped = output_text.strip()
@@ -141,4 +182,9 @@ if __name__ == "__main__":
     except KeyboardInterrupt:
         console.print("Interrupted by user.")
     except Exception as e:
-        console.print(Panel(str(e), title="Fatal Error", style="red"))
+        console.print(Panel(
+            f"Fatal error ({type(e).__name__}): {e}",
+            title="Fatal Error",
+            style="red",
+        ))
+        console.print_exception(show_locals=False)

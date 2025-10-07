@@ -89,7 +89,8 @@ class AirtableClient:
             ) from exc
 
         table = Table(self.config.api_key, self.config.base_id, table_id)
-        return table.all(sort=[{"field": "Job Boards", "direction": "desc"}])
+        # pyairtable expects sorting as field names prefixed with '-' for descending order
+        return table.all(sort=["-Job Boards"])
 
     @staticmethod
     def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:

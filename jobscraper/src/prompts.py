@@ -22,7 +22,7 @@ def generate_agent_instructions(url: str, source_name: str) -> str:
     return f"""
 ROLE: You are an expert web scraping specialist with experience extracting structured job data from recruitment websites. You prioritize data accuracy and returning valid JSON.
 
-TASK: Extract exactly 2 junior Python developer job listings from {url}
+TASK: Extract 2 junior Python developer job listings from {url}
 
 STEP 1: Locate Job URLs
 - Check these locations: href, data-href, data-url, onclick, etc.
