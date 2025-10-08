@@ -20,12 +20,42 @@ import time
 from datetime import datetime
 
 
-HARDCODED_SOURCE_URL = (
+def format_duration(seconds: float) -> str:
+    """Format duration in seconds to a human-readable string.
+    
+    Shows seconds for times under 60 seconds, minutes for longer times.
+    """
+    if seconds < 60:
+        return f"{seconds:.2f}s"
+    else:
+        minutes = seconds / 60
+        return f"{minutes:.2f} min"
+
+
+def extract_source_name(url: str) -> str:
+    """Extract a readable source name from a job board URL."""
+    if not url:
+        return "Unknown"
+    
+    # Remove protocol and www
+    url = url.replace("https://", "").replace("http://", "").replace("www.", "")
+    
+    # Extract domain name (everything before the first /)
+    if "/" in url:
+        domain = url.split("/")[0]
+    else:
+        domain = url
+    
+    return domain
+
+
+from dotenv import load_dotenv
+
+SOURCE_URL = (
     "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
 )
 
 console = Console()
-
 
 async def main() -> None:
     """Main application entry point - clean orchestration of all components"""
@@ -76,7 +106,7 @@ async def main() -> None:
             sources = client.get_all_records(sources_table_id)
             sources_fetch_end = time.time()
             sources_fetch_time = sources_fetch_end - sources_fetch_start
-            console.print(Panel(f"Fetched {len(sources)} sources from Airtable in {sources_fetch_time:.2f} seconds.", title="Sources", style="blue"))
+            console.print(Panel(f"Fetched {len(sources)} sources from Airtable in {format_duration(sources_fetch_time)}.", title="Sources", style="blue"))
 
             for i, source_record in enumerate(sources, start=1):
                 console.print(Panel(f"{i}. {json.dumps(source_record, indent=4)}", title="Source", style="blue"))
@@ -106,14 +136,18 @@ async def main() -> None:
 
             scraping_end_time = time.time()
             scraping_duration = scraping_end_time - scraping_start_time
-            console.print(f'\n[bold green]Concurrent scraping completed in {scraping_duration:.2f} seconds[/]')
+            console.print(f'\n[bold green]Concurrent scraping completed in {format_duration(scraping_duration)}[/]')
 
             # Process results
             total_records = 0
             for i, res in enumerate(results):
                 if isinstance(res, Exception):
+                    # Get source name for error reporting
+                    source_record = sources[i]
+                    source_url = source_record.get("fields", {}).get("Job Boards", "")
+                    source_name = extract_source_name(source_url)
                     console.print(Panel(
-                        f"Error scraping source {i+1}: {res}",
+                        f"Error scraping {source_name}: {res}",
                         title="Scrape Error",
                         style="red",
                     ))
@@ -121,7 +155,11 @@ async def main() -> None:
                     record_count = len(res)
                     total_records += record_count
                     all_records.extend(res)
-                    console.print(f"[dim]Source {i+1}: {record_count} jobs found[/]")
+                    # Get source name from URL
+                    source_record = sources[i]
+                    source_url = source_record.get("fields", {}).get("Job Boards", "")
+                    source_name = extract_source_name(source_url)
+                    console.print(f"[dim]{source_name}: {record_count} jobs found[/]")
             
             console.print(f'\n[bold green]Total jobs scraped: {total_records} from {len(sources)} sources[/]')
 
@@ -132,7 +170,7 @@ async def main() -> None:
                 client.create_records(all_records)
                 airtable_sync_end = time.time()
                 airtable_sync_time = airtable_sync_end - airtable_sync_start
-                console.print(f'\n[bold green]Airtable sync completed in {airtable_sync_time:.2f} seconds - created {len(all_records)} records[/]')
+                console.print(f'\n[bold green]Airtable sync completed in {format_duration(airtable_sync_time)} - created {len(all_records)} records[/]')
             else:
                 console.print(Panel(
                     "Skipping Airtable sync because hardcoded mode is enabled.",
@@ -149,15 +187,15 @@ async def main() -> None:
         # Final program timing
         program_end_time = time.time()
         total_program_time = program_end_time - program_start_time
-        console.print(f'\n[bold green]🎉 Program completed successfully in {total_program_time:.2f} seconds[/]')
+        console.print(f'\n[bold green]🎉 Program completed successfully in {format_duration(total_program_time)}[/]')
         console.print(f'[dim]Breakdown:[/]')
         if not USE_HARDCODED_SOURCE:
-            console.print(f'  • Sources fetching: {sources_fetch_time:.2f}s')
-        console.print(f'  • Job scraping: {scraping_duration:.2f}s')
+            console.print(f'  • Sources fetching: {format_duration(sources_fetch_time)}')
+        console.print(f'  • Job scraping: {format_duration(scraping_duration)}')
         if all_records and client:
-            console.print(f'  • Airtable sync: {airtable_sync_time:.2f}s')
+            console.print(f'  • Airtable sync: {format_duration(airtable_sync_time)}')
         other_time = total_program_time - scraping_duration - (sources_fetch_time if not USE_HARDCODED_SOURCE else 0) - (airtable_sync_time if all_records and client else 0)
-        console.print(f'  • Other operations: {other_time:.2f}s')
+        console.print(f'  • Other operations: {format_duration(other_time)}')
 
     except Exception as e:
         console.print(Panel(
