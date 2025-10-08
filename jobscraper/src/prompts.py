@@ -17,13 +17,13 @@ ROLE: Expert web scraper extracting structured job data. Priority: data accuracy
 
 CRITICAL RULES - ANTI-HALLUCINATION:
 - Extract ONLY information directly visible on the job detail page
-- Use "Not specified" or "N/A" for ANY missing information - NEVER infer or guess
-- If uncertain about any field, mark it as "Not specified"
+- Use "N/A" for ANY missing information - NEVER infer or guess
+- If uncertain about any field, mark it as "N/A"
 - Cross-verify extracted data appears in the source HTML/text
-- When a field is unclear, default to "Not specified" rather than approximating
+- When a field is unclear, default to "N/A" rather than approximating
 
 
-TASK: Extract 2 newest junior Python developer jobs from {url}
+TASK: Extract up to 2 newest junior Python developer jobs from {url}. If no jobs are found, return an empty array [].
 
 
 STEP 1: Locate Job URLs
@@ -50,18 +50,18 @@ STEP 3: Parse Data - FACTUAL EXTRACTION ONLY
 Extract fields using these strict rules:
 
 For each field:
-- Company: Extract ONLY the exact company name as displayed. If not visible → "Not specified"
-- Position: Extract ONLY the exact job title as shown. If not visible → "Not specified"
-- Salary: Extract ONLY if explicitly stated (e.g., "5000-7000 PLN"). If range/estimate/not shown → "Not specified"
-- Location: Extract ONLY the exact city/region mentioned. If not visible → "Not specified"
-- Requirements: List 3-5 key technical skills ONLY if explicitly listed. If unclear → "Not specified"
-- Company description: Use ONLY text from "About company" sections visible on THIS page. If not present → "Not specified"
+- Company: Extract ONLY the exact company name as displayed. If not visible → "N/A"
+- Position: Extract ONLY the exact job title as shown. If not visible → "N/A"
+- Salary: Extract ONLY if explicitly stated (e.g., "5000-7000 PLN"). If range/estimate/not shown → "N/A"
+- Location: Extract ONLY the exact city/region mentioned. If not visible → "N/A"
+- Requirements: List 3-5 key technical skills ONLY if explicitly listed. If unclear → "N/A"
+- Company description: Use ONLY text from "About company" sections visible on THIS page. If not present → "N/A"
 - Notes: Brief factual notes from THIS page only. If nothing notable → "N/A"
 
 VERIFICATION CHECKLIST (before outputting):
 □ All data extracted from the current job detail page only
 □ No data inferred from job title, company name, or assumptions
-□ All empty/missing fields marked as "Not specified" or "N/A"
+□ All empty/missing fields marked as "N/A"
 □ No information copied from the job list page
 □ Company description comes from THIS job page, not general knowledge
 
@@ -71,17 +71,17 @@ OUTPUT FORMAT (JSON array only):
 [
   {{
     "Source": "{source_name}",
-    "Link": "[full job detail URL]",
-    "Company": "[exact company name or 'Not specified']",
-    "Position": "[exact position title or 'Not specified']",
-    "Salary": "[exact salary if stated or 'Not specified']",
-    "Location": "[exact location or 'Not specified']",
-    "Notes": "[brief factual notes or 'N/A']",
-    "Requirements": "[3-5 key skills from page or 'Not specified']",
-    "Company description": "[brief info from THIS page or 'Not specified']"
+    "Link": "[string; full job detail URL]",
+    "Company": "[string; exact company name or 'N/A']",
+    "Position": "[string; exact position title or 'N/A']",
+    "Salary": "[string; exact salary if stated or 'N/A']",
+    "Location": "[string; exact location or 'N/A']",
+    "Notes": "[string; brief factual notes or 'N/A']",
+    "Requirements": "[string; 3-5 key skills from page or 'N/A']",
+    "Company description": "[string; brief info from THIS page or 'N/A']"
   }}
 ]
 \"\"\"
 
-REMEMBER: When in doubt, use "Not specified". Accuracy over completeness.
+REMEMBER: When in doubt, use "N/A". Accuracy over completeness.
 """
