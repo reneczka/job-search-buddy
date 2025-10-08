@@ -146,7 +146,7 @@ class AgentRunner:
                 model=model,
                 model_settings=ModelSettings(
                     include_usage=True,
-                    reasoning_effort="medium",
+                    reasoning_effort="minimal",
                     reasoning_verbosity="low",
                 ),
                 mcp_servers=active_servers,

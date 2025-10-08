@@ -8,19 +8,18 @@ import json
 from rich.console import Console
 from rich.panel import Panel
 
-from config import DEFAULT_DELAY_BETWEEN_SOURCES
+from config import DEFAULT_DELAY_BETWEEN_SOURCES, USE_HARDCODED_SOURCE
 
 from environment_setup import validate_and_setup_environment
 from server_manager import create_playwright_server
 from agent_runner import create_playwright_agent, run_agent_with_task
-from prompts import NARRATIVE_INSTRUCTIONS, generate_agent_instructions
+from prompts import generate_agent_instructions
 from airtable_client import AirtableClient, AirtableConfig
 
 
 HARDCODED_SOURCE_URL = (
     "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
 )
-USE_HARDCODED_SOURCE = False
 
 console = Console()
 
