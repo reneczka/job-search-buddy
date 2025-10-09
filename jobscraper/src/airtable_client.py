@@ -61,22 +61,60 @@ class AirtableClient:
         )
         return self._table
 
-    def create_records(self, records: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    def create_records(self, records: List[Dict[str, Any]]) -> Dict[str, Any]:
+        """Create records in Airtable, skipping duplicates based on Link field.
+        
+        Returns:
+            Dict with 'created' (count), 'skipped' (count), and 'records' (list of created records)
+        """
         if not records:
             console.log("[yellow]No records to create in Airtable.")
-            return []
+            return {"created": 0, "skipped": 0, "records": []}
 
         table = self._connect()
 
-        payload = [self._normalize_record(record) for record in records]
-        created = table.batch_create(payload)
+        # Fetch existing job links from Airtable
+        console.print("[dim]Fetching existing job links to check for duplicates...[/]")
+        existing_records = table.all(fields=["Link"])
+        existing_links = {r["fields"].get("Link") for r in existing_records if r["fields"].get("Link")}
+        
+        console.print(f"[dim]Found {len(existing_links)} existing jobs in Airtable[/]")
 
-        console.print(Panel(
-            f"Created {len(created)} Airtable records.",
-            title="Airtable",
-            style="green",
-        ))
-        return created
+        # Filter out duplicates
+        new_records = []
+        skipped_count = 0
+        
+        for record in records:
+            normalized = self._normalize_record(record)
+            link = normalized.get("Link")
+            
+            if link and link in existing_links:
+                skipped_count += 1
+                console.print(f"[dim yellow]Skipping duplicate: {link}[/]")
+            else:
+                new_records.append(normalized)
+        
+        # Create only new records
+        created = []
+        if new_records:
+            created = table.batch_create(new_records)
+            console.print(Panel(
+                f"Created {len(created)} new records, skipped {skipped_count} duplicates.",
+                title="Airtable",
+                style="green",
+            ))
+        else:
+            console.print(Panel(
+                f"No new records to create. Skipped {skipped_count} duplicates.",
+                title="Airtable",
+                style="yellow",
+            ))
+        
+        return {
+            "created": len(created),
+            "skipped": skipped_count,
+            "records": created
+        }
 
     def get_all_records(self, table_id: str) -> List[Dict[str, Any]]:
         """Fetch all records from a specified table."""

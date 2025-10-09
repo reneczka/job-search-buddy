@@ -167,10 +167,10 @@ async def main() -> None:
         if all_records:
             airtable_sync_start = time.time()
             if client:
-                client.create_records(all_records)
+                result = client.create_records(all_records)
                 airtable_sync_end = time.time()
                 airtable_sync_time = airtable_sync_end - airtable_sync_start
-                console.print(f'\n[bold green]Airtable sync completed in {format_duration(airtable_sync_time)} - created {len(all_records)} records[/]')
+                console.print(f'\n[bold green]Airtable sync completed in {format_duration(airtable_sync_time)} - created {result["created"]} new records, skipped {result["skipped"]} duplicates[/]')
             else:
                 console.print(Panel(
                     "Skipping Airtable sync because hardcoded mode is enabled.",
