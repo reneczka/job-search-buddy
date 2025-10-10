@@ -103,7 +103,7 @@ async def main() -> None:
                     style="red",
                 ))
                 return
-            sources = client.get_all_records(sources_table_id)
+            sources = client.get_all_records(sources_table_id, sort_by="-Job Boards")
             sources_fetch_end = time.time()
             sources_fetch_time = sources_fetch_end - sources_fetch_start
             console.print(Panel(f"Fetched {len(sources)} sources from Airtable in {format_duration(sources_fetch_time)}.", title="Sources", style="blue"))

@@ -3,12 +3,36 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse, urlunparse
 
 from rich.console import Console
 from rich.panel import Panel
 
 
 console = Console()
+
+
+def normalize_url(url: str) -> str:
+    """Normalize URL by removing query parameters and fragments.
+    
+    Examples:
+        https://example.com/job?id=123#section -> https://example.com/job
+        https://example.com/job -> https://example.com/job
+    """
+    if not url:
+        return url
+    
+    parsed = urlparse(url)
+    # Reconstruct URL without query params and fragments
+    normalized = urlunparse((
+        parsed.scheme,
+        parsed.netloc,
+        parsed.path,
+        '',  # params (usually empty)
+        '',  # query
+        ''   # fragment
+    ))
+    return normalized
 
 
 @dataclass
@@ -76,23 +100,29 @@ class AirtableClient:
         # Fetch existing job links from Airtable
         console.print("[dim]Fetching existing job links to check for duplicates...[/]")
         existing_records = table.all(fields=["Link"])
-        existing_links = {r["fields"].get("Link") for r in existing_records if r["fields"].get("Link")}
+        # Normalize existing links for comparison (strip query params)
+        existing_links_normalized = {
+            normalize_url(r["fields"].get("Link")) 
+            for r in existing_records 
+            if r["fields"].get("Link")
+        }
         
-        console.print(f"[dim]Found {len(existing_links)} existing jobs in Airtable[/]")
+        console.print(f"[dim]Found {len(existing_links_normalized)} existing jobs in Airtable[/]")
 
         # Filter out duplicates
         new_records = []
         skipped_count = 0
         
         for record in records:
-            normalized = self._normalize_record(record)
-            link = normalized.get("Link")
+            normalized_record = self._normalize_record(record)
+            link = normalized_record.get("Link")
             
-            if link and link in existing_links:
+            # Compare normalized URLs (without query params)
+            if link and normalize_url(link) in existing_links_normalized:
                 skipped_count += 1
                 console.print(f"[dim yellow]Skipping duplicate: {link}[/]")
             else:
-                new_records.append(normalized)
+                new_records.append(normalized_record)
         
         # Create only new records
         created = []
@@ -116,8 +146,13 @@ class AirtableClient:
             "records": created
         }
 
-    def get_all_records(self, table_id: str) -> List[Dict[str, Any]]:
-        """Fetch all records from a specified table."""
+    def get_all_records(self, table_id: str, sort_by: Optional[str] = None) -> List[Dict[str, Any]]:
+        """Fetch all records from a specified table.
+        
+        Args:
+            table_id: The Airtable table ID
+            sort_by: Optional field name to sort by (prefix with '-' for descending order)
+        """
         try:
             from pyairtable import Table
         except ImportError as exc:
@@ -127,8 +162,11 @@ class AirtableClient:
             ) from exc
 
         table = Table(self.config.api_key, self.config.base_id, table_id)
-        # pyairtable expects sorting as field names prefixed with '-' for descending order
-        return table.all(sort=["-Job Boards"])
+        
+        if sort_by:
+            return table.all(sort=[sort_by])
+        else:
+            return table.all()
 
     @staticmethod
     def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
