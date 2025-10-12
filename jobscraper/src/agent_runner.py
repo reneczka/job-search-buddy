@@ -16,7 +16,7 @@ from typing import Optional, List, Any, Deque
 from rich.console import Console
 from rich.panel import Panel
 from rich.text import Text
-from openai.types.shared import Reasoning, reasoning_effort
+# Removed unused imports: Reasoning, reasoning_effort
 
 from config import (
     DEFAULT_OPENAI_MODEL,
@@ -44,7 +44,7 @@ def _format_debug_data(data: Any) -> Optional[str]:
         if hasattr(data, "model_dump") and callable(getattr(data, "model_dump")):
             try:
                 return json.dumps(data.model_dump(), indent=2, ensure_ascii=False)
-            except Exception:
+            except (TypeError, json.JSONDecodeError):
                 pass
         if hasattr(data, "__dict__"):
             try:
@@ -54,12 +54,21 @@ def _format_debug_data(data: Any) -> Optional[str]:
                     if not callable(value) and not key.startswith("_")
                 }
                 return json.dumps(serializable, indent=2, ensure_ascii=False, default=str)
-            except Exception:
+            except (TypeError, json.JSONDecodeError, AttributeError):
                 pass
         return repr(data)
 
 
 def _extract_name(*candidates: Any, default: str = "unknown") -> str:
+    """Extract a name from multiple candidate sources.
+    
+    Args:
+        *candidates: Variable number of objects that might contain a name
+        default: Default value to return if no valid name is found
+        
+    Returns:
+        The first valid name found, or the default value
+    """
     for candidate in candidates:
         if not candidate:
             continue
@@ -123,7 +132,16 @@ class AgentRunner:
         self._last_displayed_message: Optional[str] = None
     
     def create_agent(self, name: str, instructions: str, mcp_servers: List[Any]) -> Any:
-        """Create an agent with MCP servers"""
+        """Create an agent with MCP servers.
+        
+        Args:
+            name: Name identifier for the agent
+            instructions: System instructions for agent behavior
+            mcp_servers: List of MCP server instances to connect
+            
+        Returns:
+            Configured Agent instance
+        """
         try:
             from agents.agent import Agent
             from agents import ModelSettings
@@ -193,7 +211,7 @@ class AgentRunner:
                     style="yellow",
                 ))
                 await asyncio.sleep(delay)
-            except Exception:
+            except (asyncio.CancelledError, SystemExit):
                 raise
 
         raise RuntimeError("OpenAI rate limit retries exhausted") from last_error
@@ -327,7 +345,7 @@ class AgentRunner:
                 step_type = getattr(step, "type", "unknown")
                 self.console.print(Panel(Text(f"Step created: {step_type}"), title="Run Step", style="blue"))
 
-        except Exception as exc:
+        except (AttributeError, TypeError, KeyError) as exc:
             self.console.print(Panel(Text(f"Stream event handling error: {exc}"), title="Stream Error", style="red"))
 
     def display_final_result(self, result: Any) -> None:

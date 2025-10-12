@@ -10,9 +10,9 @@ import asyncio
 import os
 import signal
 import subprocess
+import tempfile
 from typing import Optional
 from contextlib import asynccontextmanager
-import glob
 
 from rich.console import Console
 
@@ -35,29 +35,7 @@ class PlaywrightServerManager:
         self.server_process: Optional[subprocess.Popen] = None
         self.server_url: Optional[str] = None
     
-    def _detect_playwright_chromium(self) -> Optional[str]:
-        """Find Playwright-managed Chromium executable on macOS.
-        Returns absolute path if found, otherwise None.
-        """
-        try:
-            cache_dir = os.path.expanduser("~/Library/Caches/ms-playwright")
-            pattern = os.path.join(
-                cache_dir,
-                "chromium-*",
-                "chrome-mac",
-                "Chromium.app",
-                "Contents",
-                "MacOS",
-                "Chromium",
-            )
-            candidates = glob.glob(pattern)
-            if not candidates:
-                return None
-            # Pick the most recently modified candidate
-            candidates.sort(key=lambda p: os.path.getmtime(p), reverse=True)
-            return candidates[0]
-        except Exception:
-            return None
+    # Removed unused method: _detect_playwright_chromium
     
     async def start_server(self) -> str:
         """Start Playwright MCP server and return HTTP URL
@@ -76,7 +54,6 @@ class PlaywrightServerManager:
         self.server_url = f"{self.base_url}/mcp"  # HTTP transport endpoint per docs
         
         # Create output directory for logs
-        import tempfile
         log_dir = tempfile.mkdtemp(prefix="playwright-mcp-")
         
         cmd = [
@@ -90,19 +67,19 @@ class PlaywrightServerManager:
         
         try:
             # Create a temporary file to store the output
-            import tempfile
             with tempfile.NamedTemporaryFile(delete=False, suffix='.log') as log_file:
                 log_path = log_file.name
             
             # Start the process with output redirected to the log file
-            self.server_process = subprocess.Popen(
-                cmd,
-                stdout=open(log_path, 'w'),
-                stderr=subprocess.STDOUT,
-                text=True,
-                bufsize=1,  # Line buffered
-                universal_newlines=True
-            )
+            with open(log_path, 'w') as log_output:
+                self.server_process = subprocess.Popen(
+                    cmd,
+                    stdout=log_output,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,  # Line buffered
+                    universal_newlines=True
+                )
             
             # Wait a bit for the process to start
             console.log(f"[yellow]Waiting for server to start (PID: {self.server_process.pid})...")
@@ -128,7 +105,7 @@ class PlaywrightServerManager:
             console.log(f"[green]Playwright MCP server is ready at {self.server_url}")
             return self.server_url
             
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError, IOError) as e:
             self.stop_server()
             console.log(f"[red]Error starting Playwright MCP server: {str(e)}")
             raise
@@ -150,7 +127,7 @@ class PlaywrightServerManager:
                     except subprocess.TimeoutExpired:
                         # Last resort - force kill
                         self.server_process.kill()
-            except Exception as e:
+            except (ProcessLookupError, subprocess.TimeoutExpired, OSError) as e:
                 console.log(f"[yellow]Warning: Error stopping server process: {e}")
             finally:
                 self.server_process = None
@@ -166,7 +143,7 @@ class PlaywrightServerManager:
             subprocess.run(["pkill", "-f", "node.*playwright"], 
                          stderr=subprocess.DEVNULL, 
                          stdout=subprocess.DEVNULL)
-        except Exception as e:
+        except (subprocess.SubprocessError, OSError) as e:
             console.log(f"[yellow]Warning during process cleanup: {e}")
 
 

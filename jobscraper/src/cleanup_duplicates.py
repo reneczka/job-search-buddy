@@ -210,7 +210,7 @@ if __name__ == "__main__":
         main()
     except KeyboardInterrupt:
         console.print("\n[yellow]Cancelled by user.[/]")
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError, AttributeError) as e:
         console.print(Panel(
             f"Error: {e}",
             title="Error",

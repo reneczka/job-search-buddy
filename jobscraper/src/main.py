@@ -4,12 +4,12 @@ OpenAI Agents SDK + Playwright MCP POC with optional Airtable syncing.
 
 import asyncio
 import json
-from typing import Any
+from typing import Any, List
 
 from rich.console import Console
 from rich.panel import Panel
 
-from config import DEFAULT_DELAY_BETWEEN_SOURCES, USE_HARDCODED_SOURCE
+from config import USE_HARDCODED_SOURCE
 
 from environment_setup import validate_and_setup_environment
 from server_manager import create_playwright_server
@@ -49,11 +49,7 @@ def extract_source_name(url: str) -> str:
     return domain
 
 
-from dotenv import load_dotenv
-
-SOURCE_URL = (
-    "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
-)
+# Removed unused imports and constants
 
 console = Console()
 
@@ -67,10 +63,11 @@ async def main() -> None:
         validate_and_setup_environment()
 
         if USE_HARDCODED_SOURCE:
+            # Using a default hardcoded source for testing
             sources = [
                 {
                     "fields": {
-                        "Job Boards": HARDCODED_SOURCE_URL,
+                        "Job Boards": "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc",
                     }
                 }
             ]
@@ -197,7 +194,7 @@ async def main() -> None:
         other_time = total_program_time - scraping_duration - (sources_fetch_time if not USE_HARDCODED_SOURCE else 0) - (airtable_sync_time if all_records and client else 0)
         console.print(f'  • Other operations: {format_duration(other_time)}')
 
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError) as e:
         console.print(Panel(
             f"Application error ({type(e).__name__}): {e}",
             title="Error",
@@ -205,9 +202,20 @@ async def main() -> None:
         ))
         console.print_exception(show_locals=False)
         raise
+    except KeyboardInterrupt:
+        console.print("\n[yellow]Interrupted by user.[/]")
+        raise
 
 
 def _parse_records(output_text: str):
+    """Parse agent output to extract job records.
+    
+    Args:
+        output_text: Raw text output from the agent
+        
+    Returns:
+        List of parsed records or None if parsing fails
+    """
     if not output_text:
         return None
 
@@ -280,7 +288,7 @@ async def scrape_source(agent: Any, source_record: dict) -> list:
                 else:
                     console.print(f"[red]Retry failed for {source_name} - still no valid records[/]")
                     
-        except Exception as e:
+        except (asyncio.TimeoutError, ConnectionError, RuntimeError) as e:
             console.print(f"[red]Error during scraping attempt {attempt + 1} for {source_name}: {e}[/]")
             if attempt == max_retries:
                 console.print(f"[red]All retry attempts failed for {source_name}[/]")
@@ -295,7 +303,7 @@ if __name__ == "__main__":
         asyncio.run(main())
     except KeyboardInterrupt:
         console.print("Interrupted by user.")
-    except Exception as e:
+    except (ImportError, RuntimeError, ValueError) as e:
         console.print(Panel(
             f"Fatal error ({type(e).__name__}): {e}",
             title="Fatal Error",

@@ -22,6 +22,6 @@ def wait_http_ok(url: str, deadline: float) -> bool:
                 if resp.status in (200, 204):
                     return True
                 return True
-        except Exception:
+        except (urllib.error.URLError, ConnectionError, OSError):
             time.sleep(0.2)
     return False
