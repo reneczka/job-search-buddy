@@ -33,20 +33,24 @@ def format_duration(seconds: float) -> str:
 
 
 def extract_source_name(url: str) -> str:
-    """Extract a readable source name from a job board URL."""
+    """Extract a clean source name from a job board URL."""
     if not url:
-        return "Unknown"
+        return "unknown"
     
     # Remove protocol and www
-    url = url.replace("https://", "").replace("http://", "").replace("www.", "")
+    url = url.lower().replace("https://", "").replace("http://", "").replace("www.", "")
     
-    # Extract domain name (everything before the first /)
-    if "/" in url:
-        domain = url.split("/")[0]
-    else:
-        domain = url
+    # Extract domain name (everything before the first / or ?)
+    domain = url.split('/')[0].split('?')[0]
     
-    return domain
+    # Handle special cases for subdomains if needed
+    if domain.count('.') > 1:
+        # For subdomains, take the last two parts (e.g., 'jobs.example.com' -> 'example.com')
+        parts = domain.split('.')
+        domain = '.'.join(parts[-2:]) if len(parts) > 2 else domain
+    
+    # Return domain in lowercase
+    return domain.lower()
 
 
 # Removed unused imports and constants
@@ -259,7 +263,8 @@ async def scrape_source(agent: Any, source_record: dict) -> list:
         console.print(f"Skipping source {source_record.get('id')} due to missing URL.")
         return []
 
-    source_name = source_url
+    source_name = extract_source_name(source_url)
+    console.print(f"[dim]Processing source: {source_name} ({source_url})[/]")
 
     # Build task prompt
     task_prompt = generate_agent_instructions(url=source_url, source_name=source_name)
