@@ -1,6 +1,6 @@
 """
-Main Scraper - Orchestrates both Job Boards and Career Sites scrapers.
-Runs both scrapers sequentially and syncs all results to Airtable.
+Career Sites Scraper - Scrapes jobs from company career pages.
+Uses the "Career Sites" column from the sources table in Airtable.
 """
 
 import asyncio
@@ -15,7 +15,7 @@ from config import USE_HARDCODED_SOURCE
 from environment_setup import validate_and_setup_environment
 from server_manager import create_playwright_server
 from agent_runner import create_playwright_agent, run_agent_with_task
-from prompts import generate_job_board_instructions, generate_career_site_instructions
+from prompts import generate_career_site_instructions
 from airtable_client import AirtableClient, AirtableConfig
 import time
 from datetime import datetime
@@ -34,7 +34,7 @@ def format_duration(seconds: float) -> str:
 
 
 def extract_source_name(url: str) -> str:
-    """Extract a clean source name from a job board URL."""
+    """Extract a clean source name from a career site URL."""
     if not url:
         return "unknown"
     
@@ -46,7 +46,7 @@ def extract_source_name(url: str) -> str:
     
     # Handle special cases for subdomains if needed
     if domain.count('.') > 1:
-        # For subdomains, take the last two parts (e.g., 'jobs.example.com' -> 'example.com')
+        # For subdomains, take the last two parts (e.g., 'careers.example.com' -> 'example.com')
         parts = domain.split('.')
         domain = '.'.join(parts[-2:]) if len(parts) > 2 else domain
     
@@ -54,16 +54,13 @@ def extract_source_name(url: str) -> str:
     return domain.lower()
 
 
-# Removed unused imports and constants
-
 console = Console()
 
 async def main() -> None:
-    """Main application entry point - clean orchestration of all components"""
+    """Main application entry point for career sites scraper"""
     try:
         program_start_time = time.time()
-        console.print(f'\n[bold blue]Complete job scraping program started at {datetime.now().strftime("%H:%M:%S")}[/]')
-        console.print('[dim]Running both Job Boards and Career Sites scrapers[/]')
+        console.print(f'\n[bold blue]Career Sites scraper started at {datetime.now().strftime("%H:%M:%S")}[/]')
         
         # Validate environment and setup
         validate_and_setup_environment()
@@ -73,14 +70,13 @@ async def main() -> None:
             sources = [
                 {
                     "fields": {
-                        "Job Boards": "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc",
                         "Career Sites": "https://example.com/careers",
                     }
                 }
             ]
             client = None
             console.print(Panel(
-                "Using hardcoded job source.",
+                "Using hardcoded career site source.",
                 title="Sources",
                 style="blue",
             ))
@@ -107,61 +103,66 @@ async def main() -> None:
                     style="red",
                 ))
                 return
-            sources = client.get_all_records(sources_table_id)
+            sources = client.get_all_records(sources_table_id, sort_by="-Career Sites")
             sources_fetch_end = time.time()
             sources_fetch_time = sources_fetch_end - sources_fetch_start
-
-            # Count sources by type
-            job_boards_count = sum(1 for s in sources if s.get("fields", {}).get("Job Boards"))
-            career_sites_count = sum(1 for s in sources if s.get("fields", {}).get("Career Sites"))
-            console.print(Panel(
-                f"Fetched {len(sources)} sources from Airtable in {format_duration(sources_fetch_time)}\n"
-                f"  • Job Boards: {job_boards_count}\n"
-                f"  • Career Sites: {career_sites_count}",
-                title="Sources",
-                style="blue"
-            ))
+            console.print(Panel(f"Fetched {len(sources)} career site sources from Airtable in {format_duration(sources_fetch_time)}.", title="Sources", style="blue"))
 
             for i, source_record in enumerate(sources, start=1):
                 console.print(Panel(f"{i}. {json.dumps(source_record, indent=4)}", title="Source", style="blue"))
 
             if not sources:
                 console.print(Panel(
-                    "No sources found in Airtable.",
+                    "No career site sources found in Airtable.",
                     title="Warning",
                     style="yellow",
                 ))
                 return
 
         all_records = []
-        total_scraping_time = 0
 
+        # Scrape jobs from all sources concurrently
+        scraping_start_time = time.time()
+        console.print(f'\n[bold blue]Starting concurrent career site scraping from {len(sources)} sources...[/]')
+        
         async with create_playwright_server() as playwright_server:
             agent = create_playwright_agent(playwright_server)
 
-            # Phase 1: Scrape Job Boards
-            console.print(f'\n[bold blue]═══ Phase 1: Job Boards Scraping ═══[/]')
-            job_boards_start = time.time()
-            job_boards_results = await scrape_sources(
-                agent, sources, "Job Boards", generate_job_board_instructions
-            )
-            job_boards_duration = time.time() - job_boards_start
-            all_records.extend(job_boards_results)
-            console.print(f'[bold green]✓ Job Boards: {len(job_boards_results)} jobs in {format_duration(job_boards_duration)}[/]')
+            # Create tasks for each source
+            tasks = [scrape_source(agent, source_record) for source_record in sources]
 
-            # Phase 2: Scrape Career Sites
-            console.print(f'\n[bold blue]═══ Phase 2: Career Sites Scraping ═══[/]')
-            career_sites_start = time.time()
-            career_sites_results = await scrape_sources(
-                agent, sources, "Career Sites", generate_career_site_instructions
-            )
-            career_sites_duration = time.time() - career_sites_start
-            all_records.extend(career_sites_results)
-            console.print(f'[bold green]✓ Career Sites: {len(career_sites_results)} jobs in {format_duration(career_sites_duration)}[/]')
+            # Run all tasks concurrently and collect results
+            results = await asyncio.gather(*tasks, return_exceptions=True)
 
-            total_scraping_time = job_boards_duration + career_sites_duration
-            console.print(f'\n[bold green]Total jobs scraped: {len(all_records)} ({len(job_boards_results)} from job boards + {len(career_sites_results)} from career sites)[/]')
-        
+            scraping_end_time = time.time()
+            scraping_duration = scraping_end_time - scraping_start_time
+            console.print(f'\n[bold green]Concurrent scraping completed in {format_duration(scraping_duration)}[/]')
+
+            # Process results
+            total_records = 0
+            for i, res in enumerate(results):
+                if isinstance(res, Exception):
+                    # Get source name for error reporting
+                    source_record = sources[i]
+                    source_url = source_record.get("fields", {}).get("Career Sites", "")
+                    source_name = extract_source_name(source_url)
+                    console.print(Panel(
+                        f"Error scraping {source_name}: {res}",
+                        title="Scrape Error",
+                        style="red",
+                    ))
+                else:
+                    record_count = len(res)
+                    total_records += record_count
+                    all_records.extend(res)
+                    # Get source name from URL
+                    source_record = sources[i]
+                    source_url = source_record.get("fields", {}).get("Career Sites", "")
+                    source_name = extract_source_name(source_url)
+                    console.print(f"[dim]{source_name}: {record_count} jobs found[/]")
+            
+            console.print(f'\n[bold green]Total jobs scraped: {total_records} from {len(sources)} sources[/]')
+
         # Sync all results to Airtable offers table
         if all_records:
             airtable_sync_start = time.time()
@@ -186,14 +187,14 @@ async def main() -> None:
         # Final program timing
         program_end_time = time.time()
         total_program_time = program_end_time - program_start_time
-        console.print(f'\n[bold green]🎉 Complete scraping program finished in {format_duration(total_program_time)}[/]')
+        console.print(f'\n[bold green]🎉 Career Sites scraper completed successfully in {format_duration(total_program_time)}[/]')
         console.print(f'[dim]Breakdown:[/]')
         if not USE_HARDCODED_SOURCE:
             console.print(f'  • Sources fetching: {format_duration(sources_fetch_time)}')
-        console.print(f'  • Job scraping: {format_duration(total_scraping_time)}')
+        console.print(f'  • Job scraping: {format_duration(scraping_duration)}')
         if all_records and client:
             console.print(f'  • Airtable sync: {format_duration(airtable_sync_time)}')
-        other_time = total_program_time - total_scraping_time - (sources_fetch_time if not USE_HARDCODED_SOURCE else 0) - (airtable_sync_time if all_records and client else 0)
+        other_time = total_program_time - scraping_duration - (sources_fetch_time if not USE_HARDCODED_SOURCE else 0) - (airtable_sync_time if all_records and client else 0)
         console.print(f'  • Other operations: {format_duration(other_time)}')
 
     except (ImportError, RuntimeError, ValueError) as e:
@@ -252,62 +253,20 @@ def _parse_records(output_text: str):
     return None
 
 
-async def scrape_sources(agent: Any, sources: List[dict], column_name: str, prompt_generator) -> list:
-    """Scrape jobs from all sources for a specific column type."""
-    # Filter sources that have this column
-    relevant_sources = [s for s in sources if s.get("fields", {}).get(column_name)]
-
-    if not relevant_sources:
-        console.print(f"[dim]No {column_name} sources found, skipping...[/]")
-        return []
-
-    console.print(f"[dim]Processing {len(relevant_sources)} {column_name} sources...[/]")
-
-    # Create tasks for each source
-    tasks = [
-        scrape_source(agent, source_record, column_name, prompt_generator)
-        for source_record in relevant_sources
-    ]
-
-    # Run all tasks concurrently and collect results
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
-    # Process results
-    all_records = []
-    for i, res in enumerate(results):
-        if isinstance(res, Exception):
-            source_record = relevant_sources[i]
-            source_url = source_record.get("fields", {}).get(column_name, "")
-            source_name = extract_source_name(source_url)
-            console.print(Panel(
-                f"Error scraping {source_name}: {res}",
-                title="Scrape Error",
-                style="red",
-            ))
-        else:
-            all_records.extend(res)
-            source_record = relevant_sources[i]
-            source_url = source_record.get("fields", {}).get(column_name, "")
-            source_name = extract_source_name(source_url)
-            console.print(f"[dim]{source_name}: {len(res)} jobs[/]")
-
-    return all_records
-
-
-async def scrape_source(agent: Any, source_record: dict, column_name: str, prompt_generator) -> list:
-    """Scrape jobs from a single source asynchronously with retry logic."""
+async def scrape_source(agent: Any, source_record: dict) -> list:
+    """Scrape jobs from a single career site source asynchronously with retry logic."""
     fields = source_record.get("fields", {})
-    source_url = fields.get(column_name)
+    source_url = fields.get("Career Sites")
 
     if not source_url:
         console.print(f"Skipping source {source_record.get('id')} due to missing URL.")
         return []
 
     source_name = extract_source_name(source_url)
-    console.print(f"[dim]Processing: {source_name} ({source_url})[/]")
+    console.print(f"[dim]Processing career site: {source_name} ({source_url})[/]")
 
     # Build task prompt
-    task_prompt = prompt_generator(url=source_url, source_name=source_name)
+    task_prompt = generate_career_site_instructions(url=source_url, source_name=source_name)
 
     # Execute the task with retry logic
     max_retries = 1  # Retry once on failure
