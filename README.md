@@ -1,6 +1,6 @@
 # Job Search Buddy
 
-An intelligent job scraping application that automatically collects and organizes job listings from Polish job boards. Built with OpenAI Agents SDK and Playwright MCP, this tool scrapes job postings, extracts structured data, and syncs results to Airtable for easy management and tracking.
+An intelligent job scraping application that automatically collects and organizes job listings from Polish job boards and company career sites. Built with OpenAI Agents SDK and Playwright MCP, this tool scrapes job postings, extracts structured data, and syncs results to Airtable for easy management and tracking.
 
 ## Table of Contents
 
@@ -24,10 +24,9 @@ Job Search Buddy automates the tedious process of searching for developer jobs a
 ## Features
 
 - **AI-Powered Scraping**: Uses OpenAI Agents SDK to intelligently navigate and extract job data
-- **Multi-Source Support**: Scrapes from multiple job boards (JustJoin.it, NoFluffJobs, Pracuj.pl, etc.)
-- **Concurrent Processing**: Scrapes multiple sources simultaneously for faster results
+- **Dual Pipeline Support**: `main.py` orchestrates a job boards phase and a career sites phase for complete coverage
 - **Airtable Integration**: Automatically syncs job listings to Airtable with duplicate detection
-- **Smart Data Extraction**: Extracts company, position, salary, location, requirements, and more
+- **Extended Data Extraction**: Career site scraping captures additional details like teams, employment types, and benefits when available
 - **Duplicate Cleanup**: Built-in tool to identify and remove duplicate job listings
 - **Configurable**: Easy configuration for different models, rate limits, and scraping behavior
 
@@ -48,7 +47,9 @@ job-search-buddy/
 ├── jobscraper/
 │   ├── sources_loader.py - Loads job sources from Airtable
 │   └── src/
-│       ├── main.py - Main application entry point
+│       ├── main.py - Orchestrates job boards and career sites scraping
+│       ├── job_boards_scraper.py - Standalone job board scraper entry point
+│       ├── career_sites_scraper.py - Standalone career site scraper entry point
 │       ├── agent_runner.py - Agent creation and execution logic
 │       ├── server_manager.py - Playwright MCP server management
 │       ├── airtable_client.py - Airtable API integration
@@ -125,22 +126,31 @@ job-search-buddy/
 
 ## Usage
 
-### Running the Scraper
+### Running the Scrapers
 
-Navigate to the source directory and run the main script:
-
+1. Navigate to the scraper sources directory:
 ```bash
 cd jobscraper/src
-conda activate job-search-buddy
-python3 main.py
 ```
 
-The scraper will:
-1. Fetch job sources from Airtable
-2. Scrape each source concurrently
-3. Extract structured job data
-4. Sync results to Airtable (skipping duplicates)
-5. Display timing statistics
+2. Activate the conda environment:
+```bash
+conda activate job-search-buddy
+```
+
+3. Choose how you want to run the scrapers:
+```bash
+python main.py                   # run both job boards and career sites sequentially
+python job_boards_scraper.py     # scrape job boards only
+python career_sites_scraper.py   # scrape company career sites only
+```
+
+Running `main.py` will:
+- **Fetch sources**: load the `sources` table from Airtable and detect which columns are populated.
+- **Phase 1 — Job Boards**: scrape all records with a `Job Boards` URL concurrently.
+- **Phase 2 — Career Sites**: scrape all records with a `Career Sites` URL concurrently using the extended prompt.
+- **Sync to Airtable**: merge the combined results, skip duplicates, and create new entries in the `offers` table.
+- **Report timings**: print per-phase and total execution timings for transparency.
 
 ### Cleaning Duplicates
 
