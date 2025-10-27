@@ -14,6 +14,7 @@ import tempfile
 from typing import Optional
 from contextlib import asynccontextmanager
 
+import httpx
 from rich.console import Console
 
 from mcp_utils import find_free_port
@@ -69,7 +70,7 @@ class PlaywrightServerManager:
             # Create a temporary file to store the output
             with tempfile.NamedTemporaryFile(delete=False, suffix='.log') as log_file:
                 log_path = log_file.name
-            
+
             # Start the process with output redirected to the log file
             with open(log_path, 'w') as log_output:
                 self.server_process = subprocess.Popen(
@@ -80,31 +81,40 @@ class PlaywrightServerManager:
                     bufsize=1,  # Line buffered
                     universal_newlines=True
                 )
-            
-            # Wait a bit for the process to start
-            console.log(f"[yellow]Waiting for server to start (PID: {self.server_process.pid})...")
-            await asyncio.sleep(5)  # Increased wait time
-            
-            # Check if the process is still running after initial wait
-            if self.server_process.poll() is not None:
-                # Process has already exited, read the log file
-                with open(log_path, 'r') as f:
-                    log_output = f.read()
-                
-                # Try to get any error output from the log
-                error_msg = f"Process exited with code {self.server_process.returncode}.\n"
-                if log_output:
-                    error_msg += f"Log output:\n{log_output}"
-                else:
-                    error_msg += "No output was captured in the log file."
-                
-                console.log(f"[red]{error_msg}")
-                raise RuntimeError("Failed to start Playwright MCP server")
-            
-            # Assume server is ready at the documented endpoint
-            console.log(f"[green]Playwright MCP server is ready at {self.server_url}")
-            return self.server_url
-            
+
+            console.log(
+                f"[yellow]Waiting for server to start (PID: {self.server_process.pid})...\n"
+                f"[blue]Playwright MCP server log: {log_path}"
+            )
+
+            deadline = asyncio.get_event_loop().time() + 30
+            async with httpx.AsyncClient(timeout=2.0) as client:
+                while asyncio.get_event_loop().time() < deadline:
+                    if self.server_process.poll() is not None:
+                        with open(log_path, 'r') as f:
+                            log_output = f.read()
+
+                        error_msg = f"Process exited with code {self.server_process.returncode}.\n"
+                        if log_output:
+                            error_msg += f"Log output:\n{log_output}"
+                        else:
+                            error_msg += "No output was captured in the log file."
+
+                        console.log(f"[red]{error_msg}")
+                        raise RuntimeError("Failed to start Playwright MCP server")
+
+                    try:
+                        response = await client.get(self.server_url)
+                        if response.status_code < 500:
+                            console.log(f"[green]Playwright MCP server is ready at {self.server_url}")
+                            return self.server_url
+                    except (httpx.HTTPError, OSError):
+                        pass
+
+                    await asyncio.sleep(1)
+
+            raise RuntimeError("Timed out waiting for Playwright MCP server to become ready")
+
         except (subprocess.SubprocessError, OSError, IOError) as e:
             self.stop_server()
             console.log(f"[red]Error starting Playwright MCP server: {str(e)}")
