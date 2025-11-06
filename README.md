@@ -58,7 +58,8 @@ job-search-buddy/
 │       ├── environment_setup.py - Environment validation
 │       ├── mcp_utils.py - MCP utility functions
 │       └── prompts.py - Agent instruction templates
-├── requirements.txt - Python dependencies
+├── pyproject.toml - Project metadata and dependencies
+├── poetry.lock - Locked dependency versions
 ├── .env - Environment variables (not tracked)
 └── README.md - Project documentation
 ```
@@ -68,7 +69,7 @@ job-search-buddy/
 ### Prerequisites
 
 - Python 3.11 or higher
-- Conda/Anaconda (recommended for environment management)
+- [Poetry](https://python-poetry.org/) (dependency and virtualenv management)
 - Node.js and npm (for Playwright MCP)
 - Airtable account with API access
 - OpenAI API key (or OpenRouter for alternative models)
@@ -82,26 +83,21 @@ job-search-buddy/
    cd job-search-buddy
    ```
 
-2. **Create and activate conda environment:**
+2. **Install Python dependencies with Poetry:**
 
    ```bash
-   conda create -n job-search-buddy python=3.11
-   conda activate job-search-buddy
+   poetry install
    ```
 
-3. **Install Python dependencies:**
+3. **(Optional) Activate the Poetry virtual environment:**
 
    ```bash
-   pip install -r requirements.txt
+   poetry shell
    ```
 
-4. **Install OpenAI Agents SDK:**
+   Alternatively, prefix commands with `poetry run` (shown below).
 
-   ```bash
-   pip install git+https://github.com/openai/openai-agents-python
-   ```
-
-5. **Set up environment variables:**
+4. **Set up environment variables:**
 
    Create a `.env` file in the project root:
 
@@ -118,10 +114,10 @@ job-search-buddy/
    AIRTABLE_SOURCES_TABLE_ID=your_sources_table_id
    ```
 
-6. **Install Playwright browsers:**
+5. **Install Playwright browsers:**
 
    ```bash
-   playwright install chromium
+   poetry run playwright install chromium
    ```
 
 ## Usage
@@ -133,16 +129,11 @@ job-search-buddy/
 cd jobscraper/src
 ```
 
-2. Activate the conda environment:
+2. Choose how you want to run the scrapers:
 ```bash
-conda activate job-search-buddy
-```
-
-3. Choose how you want to run the scrapers:
-```bash
-python main.py                   # run both job boards and career sites sequentially
-python job_boards_scraper.py     # scrape job boards only
-python career_sites_scraper.py   # scrape company career sites only
+poetry run python main.py                   # run both job boards and career sites sequentially
+poetry run python job_boards_scraper.py     # scrape job boards only
+poetry run python career_sites_scraper.py   # scrape company career sites only
 ```
 
 Running `main.py` will:
@@ -158,12 +149,12 @@ To remove duplicate job listings from Airtable:
 
 **Dry run (preview only):**
 ```bash
-python3 cleanup_duplicates.py --dry-run
+poetry run python cleanup_duplicates.py --dry-run
 ```
 
 **Actually delete duplicates:**
 ```bash
-python3 cleanup_duplicates.py
+poetry run python cleanup_duplicates.py
 ```
 
 The cleanup script will:
