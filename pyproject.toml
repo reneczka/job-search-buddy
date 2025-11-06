@@ -1,0 +1,33 @@
+[project]
+name = "job-search-buddy"
+version = "0.1.0"
+description = ""
+authors = [
+    {name = "reneczka",email = "46569696+reneczka@users.noreply.github.com"}
+]
+readme = "README.md"
+requires-python = ">=3.11"
+dependencies = [
+    "python-dotenv (==1.0.0)",
+    "rich (==13.7.0)",
+    "pyairtable (==2.1.0)",
+    "httpx (>=0.27,<1.0)",
+    "openai (>=2.7.1,<3.0.0)",
+    "litellm (>=1.67.4.post1,<2)",
+    "playwright (==1.40.0)",
+    "openai-agents[litellm] (>=0.5.0,<0.6.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "pytest (==8.4.2)",
+    "black (==23.11.0)"
+]
+
+[tool.poetry]
+package-mode = false
