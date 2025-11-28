@@ -1,0 +1,40 @@
+{
+  "required_skills": [
+    "python",
+    "django",
+    "postgresql",
+    "git"
+  ],
+  "preferred_skills": [
+    "asyncio",
+    "fastapi",
+    "pytest"
+  ],
+  "bonus_skills": [
+    "react",
+    "docker",
+    "aws"
+  ],
+  "dealbreakers": [
+    "on-site only"
+  ],
+  "exclude_keywords": [
+    "senior",
+    "principal",
+    "team lead"
+  ],
+  "preferred_locations": [
+    "remote",
+    "warsaw",
+    "krakow"
+  ],
+  "salary_min": 1,
+  "salary_max": 1000000,
+  "weights": {
+    "keywords": 0.45,
+    "excludes": 0.25,
+    "location": 0.15,
+    "salary": 0.15
+  },
+  "target_seniority": "junior"
+}
