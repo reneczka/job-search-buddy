@@ -24,7 +24,7 @@ Job Search Buddy automates the tedious process of searching for developer jobs a
 ## Features
 
 - **AI-Powered Scraping**: Uses OpenAI Agents SDK to intelligently navigate and extract job data
-- **Dual Pipeline Support**: `main.py` orchestrates a job boards phase and a career sites phase for complete coverage
+- **Dual Scraper Support**: Separate scrapers for job boards and company career sites
 - **Airtable Integration**: Automatically syncs job listings to Airtable with duplicate detection
 - **Extended Data Extraction**: Career site scraping captures additional details like teams, employment types, and benefits when available
 - **Duplicate Cleanup**: Built-in tool to identify and remove duplicate job listings
@@ -47,9 +47,9 @@ job-search-buddy/
 ├── jobscraper/
 │   ├── sources_loader.py - Loads job sources from Airtable
 │   └── src/
-│       ├── main.py - Orchestrates job boards and career sites scraping
-│       ├── job_boards_scraper.py - Standalone job board scraper entry point
-│       ├── career_sites_scraper.py - Standalone career site scraper entry point
+│       ├── job_boards_scraper.py - Entry point for job board scraping
+│       ├── career_sites_scraper.py - Entry point for career site scraping
+│       ├── scrape_runner.py - Shared scraping orchestration logic
 │       ├── agent_runner.py - Agent creation and execution logic
 │       ├── server_manager.py - Playwright MCP server management
 │       ├── airtable_client.py - Airtable API integration
@@ -129,19 +129,17 @@ job-search-buddy/
 cd jobscraper/src
 ```
 
-2. Choose how you want to run the scrapers:
+2. Choose which scraper to run:
 ```bash
-poetry run python main.py                   # run both job boards and career sites sequentially
 poetry run python job_boards_scraper.py     # scrape job boards only
 poetry run python career_sites_scraper.py   # scrape company career sites only
 ```
 
-Running `main.py` will:
-- **Fetch sources**: load the `sources` table from Airtable and detect which columns are populated.
-- **Phase 1 — Job Boards**: scrape all records with a `Job Boards` URL concurrently.
-- **Phase 2 — Career Sites**: scrape all records with a `Career Sites` URL concurrently using the extended prompt.
-- **Sync to Airtable**: merge the combined results, skip duplicates, and create new entries in the `offers` table.
-- **Report timings**: print per-phase and total execution timings for transparency.
+Each scraper will:
+- **Fetch sources**: load the `sources` table from Airtable.
+- **Scrape concurrently**: process all sources with matching URLs in parallel.
+- **Sync to Airtable**: skip duplicates and create new entries in the `offers` table.
+- **Report timings**: print execution timings for transparency.
 
 ### Cleaning Duplicates
 
