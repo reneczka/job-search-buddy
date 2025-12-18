@@ -204,6 +204,13 @@ async def main() -> None:
         ))
         console.print_exception(show_locals=False)
         raise
+    except asyncio.CancelledError:
+        console.print(Panel(
+            "Scraping was cancelled (likely due to Playwright server disconnect/cleanup).",
+            title="Cancelled",
+            style="yellow",
+        ))
+        return
     except KeyboardInterrupt:
         console.print("\n[yellow]Interrupted by user.[/]")
         raise

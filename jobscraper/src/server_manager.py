@@ -178,8 +178,24 @@ async def create_playwright_server():
             client_session_timeout_seconds=MCP_DEFAULT_TOOL_TIMEOUT_SECONDS,
         )
 
-        async with server:
+        await server.__aenter__()
+        exc_type = None
+        exc = None
+        tb = None
+        try:
             yield server
+        except BaseException as raised:
+            exc_type = type(raised)
+            exc = raised
+            tb = raised.__traceback__
+            raise
+        finally:
+            try:
+                await server.__aexit__(exc_type, exc, tb)
+            except asyncio.CancelledError:
+                raise
+            except Exception as cleanup_exc:
+                console.log(f"[yellow]Error cleaning up server: {cleanup_exc}")
 
     finally:
         playwright_manager.stop_server()

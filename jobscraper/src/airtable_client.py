@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -171,6 +172,35 @@ class AirtableClient:
     @staticmethod
     def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
         """Accept either raw field dicts or objects containing a `fields` key."""
-        if "fields" in record and isinstance(record["fields"], dict):
-            return record["fields"]
-        return record
+        fields = record["fields"] if "fields" in record and isinstance(record["fields"], dict) else record
+
+        if isinstance(fields, dict) and "Requirements" in fields:
+            requirements = fields.get("Requirements")
+
+            if requirements is None:
+                fields.pop("Requirements", None)
+            elif isinstance(requirements, list):
+                normalized = [str(item).strip() for item in requirements if item is not None and str(item).strip()]
+                value = ", ".join(normalized).replace("\n", " ").strip()
+                if value:
+                    fields["Requirements"] = value
+                else:
+                    fields.pop("Requirements", None)
+            elif isinstance(requirements, dict):
+                try:
+                    value = json.dumps(requirements, ensure_ascii=False)
+                except TypeError:
+                    value = str(requirements)
+                value = value.replace("\n", " ").strip()
+                if value:
+                    fields["Requirements"] = value
+                else:
+                    fields.pop("Requirements", None)
+            else:
+                value = str(requirements).replace("\n", " ").strip()
+                if value:
+                    fields["Requirements"] = value
+                else:
+                    fields.pop("Requirements", None)
+
+        return fields
