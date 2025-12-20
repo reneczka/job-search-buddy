@@ -1,40 +1,47 @@
 {
-  "required_skills": [
-    "python",
-    "django",
-    "postgresql",
-    "git"
-  ],
-  "preferred_skills": [
-    "asyncio",
-    "fastapi",
-    "pytest"
-  ],
-  "bonus_skills": [
-    "react",
-    "docker",
-    "aws"
-  ],
-  "dealbreakers": [
-    "on-site only"
-  ],
-  "exclude_keywords": [
-    "senior",
-    "principal",
-    "team lead"
-  ],
   "preferred_locations": [
-    "remote",
-    "warsaw",
-    "krakow"
+    "Remote",
+    "Wrocław",
+    "Poznań",
+    "Łódź",
+    "Katowice"
   ],
-  "salary_min": 1,
-  "salary_max": 1000000,
-  "weights": {
-    "keywords": 0.45,
-    "excludes": 0.25,
-    "location": 0.15,
-    "salary": 0.15
-  },
-  "target_seniority": "junior"
+  "preferred_employment_types": [
+    "B2B",
+    "UoP"
+  ],
+  "minimum_salary_pln": 5000,
+  "experience_levels": [
+    "Junior",
+    "Entry",
+    "Intern"
+  ],
+  "required_keywords": [
+    "Python",
+    "FastAPI",
+    "SQL",
+    "PostgreSQL",
+    "Git"
+  ],
+  "preferred_keywords": [
+    "Docker",
+    "pytest",
+    "CI/CD",
+    "Linux",
+    "Redis"
+  ],
+  "bonus_keywords": [
+    "AWS",
+    "Kubernetes",
+    "Airflow",
+    "Playwright",
+    "LLM"
+  ],
+  "excluded_keywords": [
+    "Senior",
+    "Lead",
+    "Principal",
+    "Staff",
+    "Manager"
+  ]
 }
