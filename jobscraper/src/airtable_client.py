@@ -168,9 +168,72 @@ class AirtableClient:
         else:
             return table.all()
 
+    def get_record(self, record_id: str, fields: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """Fetch a single record from the offers table by Airtable record ID."""
+        table = self._connect()
+        try:
+            return table.get(record_id, fields=fields)
+        except Exception as exc:  # noqa: BLE001 - pyairtable raises generic exceptions
+            console.print(Panel(
+                f"Failed to fetch Airtable record {record_id}: {exc}",
+                title="Airtable",
+                style="red",
+            ))
+            return None
+
+    def batch_update_records(self, updates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Batch update multiple records in the offers table."""
+        if not updates:
+            return []
+
+        table = self._connect()
+        results: List[Dict[str, Any]] = []
+        chunk_size = 10  # Airtable API limit per request
+
+        for i in range(0, len(updates), chunk_size):
+            chunk = updates[i : i + chunk_size]
+            try:
+                results.extend(table.batch_update(chunk))
+            except Exception as exc:  # noqa: BLE001
+                console.print(Panel(
+                    f"Failed to update Airtable records chunk starting at index {i}: {exc}",
+                    title="Airtable",
+                    style="red",
+                ))
+        return results
+
     @staticmethod
     def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:
         """Accept either raw field dicts or objects containing a `fields` key."""
-        if "fields" in record and isinstance(record["fields"], dict):
-            return record["fields"]
-        return record
+        fields = record["fields"] if "fields" in record and isinstance(record["fields"], dict) else record
+
+        if isinstance(fields, dict) and "Requirements" in fields:
+            requirements = fields.get("Requirements")
+
+            if requirements is None:
+                fields.pop("Requirements", None)
+            elif isinstance(requirements, list):
+                normalized = [str(item).strip() for item in requirements if item is not None and str(item).strip()]
+                value = ", ".join(normalized).replace("\n", " ").strip()
+                if value:
+                    fields["Requirements"] = value
+                else:
+                    fields.pop("Requirements", None)
+            elif isinstance(requirements, dict):
+                try:
+                    value = json.dumps(requirements, ensure_ascii=False)
+                except TypeError:
+                    value = str(requirements)
+                value = value.replace("\n", " ").strip()
+                if value:
+                    fields["Requirements"] = value
+                else:
+                    fields.pop("Requirements", None)
+            else:
+                value = str(requirements).replace("\n", " ").strip()
+                if value:
+                    fields["Requirements"] = value
+                else:
+                    fields.pop("Requirements", None)
+
+        return fields

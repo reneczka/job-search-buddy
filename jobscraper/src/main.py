@@ -17,6 +17,7 @@ from server_manager import create_playwright_server
 from agent_runner import create_playwright_agent, run_agent_with_task
 from prompts import generate_job_board_instructions, generate_career_site_instructions
 from airtable_client import AirtableClient, AirtableConfig
+from scoring import score_records
 import time
 from datetime import datetime
 
@@ -163,6 +164,8 @@ async def main() -> None:
             console.print(f'\n[bold green]Total jobs scraped: {len(all_records)} ({len(job_boards_results)} from job boards + {len(career_sites_results)} from career sites)[/]')
         
         # Sync all results to Airtable offers table
+        airtable_sync_time = 0
+        scoring_time = 0
         if all_records:
             airtable_sync_start = time.time()
             if client:
@@ -170,6 +173,20 @@ async def main() -> None:
                 airtable_sync_end = time.time()
                 airtable_sync_time = airtable_sync_end - airtable_sync_start
                 console.print(f'\n[bold green]Airtable sync completed in {format_duration(airtable_sync_time)} - created {result["created"]} new records, skipped {result["skipped"]} duplicates[/]')
+                
+                # Score newly created records
+                created_ids = [r["id"] for r in result.get("records", [])]
+                if created_ids:
+                    console.print(f'\n[bold blue]Starting job scoring for {len(created_ids)} new records...[/]')
+                    scoring_start = time.time()
+                    await score_records(
+                        airtable_client=client,
+                        record_ids=created_ids,
+                        cv_path="cv.md",
+                        preferences_path="preferences.json",
+                    )
+                    scoring_time = time.time() - scoring_start
+                    console.print(f'[bold green]Job scoring completed in {format_duration(scoring_time)}[/]')
             else:
                 console.print(Panel(
                     "Skipping Airtable sync because hardcoded mode is enabled.",
@@ -193,7 +210,9 @@ async def main() -> None:
         console.print(f'  • Job scraping: {format_duration(total_scraping_time)}')
         if all_records and client:
             console.print(f'  • Airtable sync: {format_duration(airtable_sync_time)}')
-        other_time = total_program_time - total_scraping_time - (sources_fetch_time if not USE_HARDCODED_SOURCE else 0) - (airtable_sync_time if all_records and client else 0)
+            if scoring_time > 0:
+                console.print(f'  • Job scoring: {format_duration(scoring_time)}')
+        other_time = total_program_time - total_scraping_time - (sources_fetch_time if not USE_HARDCODED_SOURCE else 0) - (airtable_sync_time if all_records and client else 0) - scoring_time
         console.print(f'  • Other operations: {format_duration(other_time)}')
 
     except (ImportError, RuntimeError, ValueError) as e:

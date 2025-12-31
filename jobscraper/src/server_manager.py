@@ -52,7 +52,7 @@ class PlaywrightServerManager:
         port = find_free_port()
         # Use the documented endpoint for HTTP transport
         self.base_url = f"http://127.0.0.1:{port}"
-        self.server_url = f"{self.base_url}/mcp"  # HTTP transport endpoint per docs
+        self.server_url = f"{self.base_url}/mcp"  # Use /mcp endpoint as shown in server logs
         
         # Create output directory for logs
         log_dir = tempfile.mkdtemp(prefix="playwright-mcp-")
@@ -63,7 +63,8 @@ class PlaywrightServerManager:
             "--host=127.0.0.1",
             f"--output-dir={log_dir}",
             "--timeout-action", str(MCP_PLAYWRIGHT_TIMEOUT_SECONDS * 1000),
-            "--timeout-navigation", str(MCP_PLAYWRIGHT_TIMEOUT_SECONDS * 1000)
+            "--timeout-navigation", str(MCP_PLAYWRIGHT_TIMEOUT_SECONDS * 1000),
+            "--allow-origins", "http://127.0.0.1:*"
         ]
         
         try:
@@ -104,10 +105,16 @@ class PlaywrightServerManager:
                         raise RuntimeError("Failed to start Playwright MCP server")
 
                     try:
-                        response = await client.get(self.server_url)
-                        if response.status_code < 500:
-                            console.log(f"[green]Playwright MCP server is ready at {self.server_url}")
-                            return self.server_url
+                        # Try both /mcp and /sse endpoints for health check
+                        for endpoint in ["/mcp", "/sse"]:
+                            try:
+                                health_url = f"{self.base_url}{endpoint}"
+                                response = await client.get(health_url)
+                                if response.status_code < 500:
+                                    console.log(f"[green]Playwright MCP server is ready at {self.server_url}")
+                                    return self.server_url
+                            except (httpx.HTTPError, OSError):
+                                continue
                     except (httpx.HTTPError, OSError):
                         pass
 
@@ -161,19 +168,20 @@ class PlaywrightServerManager:
 async def create_playwright_server():
     """Context manager that yields a ready Playwright MCP server"""
     try:
-        from agents.mcp import MCPServerStreamableHttp
+        from agents.mcp import MCPServerStdio
     except ImportError as e:
         raise RuntimeError(f"OpenAI Agents SDK not available: {e}")
 
-    playwright_manager = PlaywrightServerManager()
-    server = None
-
     try:
-        playwright_url = await playwright_manager.start_server()
-        server = MCPServerStreamableHttp(
+        # Use stdio transport instead of HTTP
+        server = MCPServerStdio(
             {
-                "url": playwright_url,
-                "timeout": MCP_DEFAULT_SSE_TIMEOUT,
+                "command": "npx",
+                "args": [
+                    "-y", "@playwright/mcp@latest",
+                    "--timeout-action", str(MCP_PLAYWRIGHT_TIMEOUT_SECONDS * 1000),
+                    "--timeout-navigation", str(MCP_PLAYWRIGHT_TIMEOUT_SECONDS * 1000)
+                ]
             },
             client_session_timeout_seconds=MCP_DEFAULT_TOOL_TIMEOUT_SECONDS,
         )
@@ -181,5 +189,6 @@ async def create_playwright_server():
         async with server:
             yield server
 
-    finally:
-        playwright_manager.stop_server()
+    except Exception as e:
+        console.log(f"[red]Error starting Playwright MCP server: {str(e)}")
+        raise
