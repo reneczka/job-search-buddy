@@ -43,5 +43,10 @@
     "Principal",
     "Staff",
     "Manager"
-  ]
+  ],
+  "hard_rule_messages": {
+    "missing_required_keywords": "Score 0: offer must mention ({keywords}).",
+    "missing_junior_keywords": "Score 0: missing junior-level keywords ({keywords}).",
+    "contains_excluded_keywords": "Score 0: senior-level wording detected."
+  }
 }
