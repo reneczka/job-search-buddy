@@ -17,8 +17,8 @@ from contextlib import asynccontextmanager
 import httpx
 from rich.console import Console
 
-from mcp_utils import find_free_port
-from config import (
+from .mcp_utils import find_free_port
+from .config import (
     MCP_DEFAULT_SSE_TIMEOUT,
     MCP_DEFAULT_TOOL_TIMEOUT_SECONDS,
     MCP_PLAYWRIGHT_TIMEOUT_SECONDS,

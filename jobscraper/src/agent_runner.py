@@ -18,7 +18,7 @@ from rich.panel import Panel
 from rich.text import Text
 # Removed unused imports: Reasoning, reasoning_effort
 
-from config import (
+from .config import (
     DEFAULT_OPENAI_MODEL,
     MCP_MAX_TURNS,
     RATE_LIMIT_MAX_RETRIES,
@@ -29,7 +29,7 @@ from config import (
     VERBOSE_MCP_LOGGING,
     VERBOSE_AGENT_DECISIONS,
 )
-from prompts import NARRATIVE_INSTRUCTIONS
+from .prompts import NARRATIVE_INSTRUCTIONS
 
 console = Console()
 

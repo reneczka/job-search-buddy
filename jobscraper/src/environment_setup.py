@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 from rich.panel import Panel
 
-from config import (
+from .config import (
     DEFAULT_OPENAI_TIMEOUT,
     DEFAULT_OPENAI_MAX_RETRIES,
 )
