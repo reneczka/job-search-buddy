@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 from typing import List
+from urllib.parse import urlparse
 
 from rich.console import Console
 from rich.panel import Panel
@@ -9,19 +10,19 @@ from dotenv import load_dotenv
 
 from .environment_setup import validate_and_setup_environment
 
-from pydantic_ai import Agent
+from pydantic_ai import Agent, UsageLimits
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
-from pydantic_ai.mcp import MCPServerStdio, MCPServerStreamableHTTP
+from pydantic_ai.mcp import MCPServerStdio
 
 
-console = Console()
+console = Console(markup=False)
 
-# MCP transport selection: True = HTTP, False = stdio (default)
-USE_MCP_HTTP_TRANSPORT = False
-
-# Simple hardcoded job board URL for the PydanticAI sandbox.
-JOB_BOARD_URL = "https://justjoin.it/job-offers/all-locations/python?experience-level=junior&orderBy=DESC&sortBy=newest"
+# Simple hardcoded job board URLs for the PydanticAI sandbox.
+JOBBOARD_URLS: List[str] = [
+    # "https://justjoin.it/job-offers/all-locations/python?experience-level=junior&orderBy=DESC&sortBy=newest",
+    "https://theprotocol.it/filtry/python;t/trainee,assistant,junior;p?sort=date"
+]
 
 
 def build_model() -> OpenAIChatModel:
@@ -33,9 +34,12 @@ def build_model() -> OpenAIChatModel:
     # Make sure .env is loaded before reading OPENAI_* variables
     load_dotenv()
 
-    model_name = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+    model_name = os.getenv("OPENAI_MODEL")
     base_url = os.getenv("OPENAI_API_BASE", "https://api.openai.com/v1")
     api_key = os.getenv("OPENAI_API_KEY")
+
+    if not model_name:
+        raise RuntimeError("OPENAI_MODEL is not set; cannot run PydanticAI sandbox.")
 
     if not api_key:
         raise RuntimeError("OPENAI_API_KEY is not set; cannot run PydanticAI sandbox.")
@@ -46,77 +50,115 @@ def build_model() -> OpenAIChatModel:
 
 model = build_model()
 
-# Configure a Playwright MCP server for PydanticAI.
-if USE_MCP_HTTP_TRANSPORT:
-    playwright_url = os.getenv("PLAYWRIGHT_MCP_HTTP_URL", "").strip()
-    if not playwright_url:
-        raise RuntimeError("PLAYWRIGHT_MCP_HTTP_URL must be set when USE_MCP_HTTP_TRANSPORT=True.")
-    playwright_server = MCPServerStreamableHTTP(playwright_url)
-else:
-    playwright_server = MCPServerStdio(
-        command="npx",
-        args=["-y", "@playwright/mcp@latest"],
-    )
+playwright_server = MCPServerStdio(
+    command="npx",
+    args=["-y", "@playwright/mcp@latest"],
+)
 
 system_prompt = (
-    "ROLE: Lightweight orchestrator for a job scraping toolchain using an MCP Playwright browser. "
-    "You receive exactly one job board URL. "
-    "Your job is to use the MCP Playwright tools to open the page in a real browser, "
-    "accept cookie / privacy banners if needed so the content is visible, and "
-    "collect links to individual job detail offers. "
-    "Return the final result strictly as a Python list of strings (job detail URLs), "
-    "with no explanations or extra text."
+    "ROLE: Job link collector using Playwright MCP. "
+    "TASK: Collect all job-detail URLs from a job board page. "
+    "RULES: "
+    "1) Stay on the same domain. "
+    "2) No new tabs, no popups. "
+    "3) Use browser_run_code ONCE with a function that scrolls and finds links. "
+    "4) Return ONLY a list of URLs, nothing else."
 )
 
 agent: Agent[None, List[str]] = Agent(
     model,
+    name="jobboard_link_collector",
     system_prompt=system_prompt,
     toolsets=[playwright_server],
 )
 
 
-async def run_sandbox(url: str | None = None) -> None:
-    """Run the minimal PydanticAI sandbox for a single job board URL."""
-    validate_and_setup_environment()
-
-    url_to_use = (url or JOB_BOARD_URL).strip()
+async def collect_job_links(url: str) -> List[str]:
+    """Run the jobboard agent for a single URL and return collected links."""
+    url_to_use = url.strip()
     if not url_to_use:
         raise RuntimeError("No job board URL provided.")
 
-    console.print(Panel(f"Running PydanticAI sandbox for:\n{url_to_use}", title="PydanticAI Sandbox", style="magenta"))
+    console.print(f"[subagent][jobboard] Starting scraping for URL: {url_to_use}")
+    console.print("[subagent][jobboard] Agent will use a single browser_run_code Playwright snippet to collect job-detail links.")
 
-    # Minimal task description for the MCP Playwright-based agent.
     user_message = (
-        "ROLE: Job board link collector using an MCP Playwright browser for a junior Python job scraping pipeline.\n\n"
-        "CONTEXT: We have a job board page that lists many offers. "
-        "Your task is ONLY to discover job detail URLs on that page, using the available MCP Playwright browser tools. "
-        "You should open the page in the browser, wait for 5 seconds to allow any cookie/consent banners to appear, "
-        "accept or close them if they block the content, and then "
-        "collect links to individual job detail offers.\n\n"
-        "TASK:\n"
-        "- Use the MCP Playwright tools to navigate to the provided URL.\n"
-        "- Wait for 5 seconds after page load to ensure cookie banners are visible.\n"
-        "- Accept or close any cookie/consent overlays so the job list is visible.\n"
-        "- Identify links that clearly correspond to individual job detail pages (not category or search pages).\n"
-        "- Do NOT invent or guess URLs; only use links that actually exist on the page.\n\n"
-        "OUTPUT:\n"
-        "- Return ONLY a valid JSON array of strings (URLs), nothing else.\n"
-        "- Example: [\"https://example.com/job/1\", \"https://example.com/job/2\"]\n"
-        "- If no links found, return []\n\n"
-        f"JOB_BOARD_URL: {url_to_use}"
+        f"TASK: Collect all job-detail URLs from: {url_to_use}\n\n"
+        "HINTS: Look for job links with patterns like /job-offer/, /oferta/, /job/, /career/, /position/, /szczegoly/praca/. Scroll to load lazy content. Filter out ads (sponsored, promoted, ad banners). Return unique URLs. STAY ON CURRENT PAGE - DO NOT OPEN NEW TABS OR NAVIGATE TO OTHER PAGES.\n\n"
+        "COPY AND RUN THIS CODE in browser_run_code:\n\n"
+        "async (page) => {\n"
+        "  await page.goto('{url_to_use}');\n"
+        "  await page.waitForTimeout(2000);\n"
+        "  const seen = new Set();\n"
+        "  let prevY = 0;\n"
+        "  let stable = 0;\n"
+        "  for (let i = 0; i < 60; i++) {\n"
+        "    await page.evaluate(() => window.scrollBy(0, window.innerHeight));\n"
+        "    await page.waitForTimeout(300);\n"
+        "    const { y, h } = await page.evaluate(() => ({ y: window.scrollY, h: document.body.scrollHeight }));\n"
+        "    const links = await page.evaluate(() => {\n"
+        "      const anchors = Array.from(document.querySelectorAll('a[href]'));\n"
+        "      return anchors.map(a => a.href);\n"
+        "    });\n"
+        "    links.forEach(href => seen.add(href));\n"
+        "    if (Math.abs(y - prevY) < 5) {\n"
+        "      stable++;\n"
+        "      if (stable >= 3) {\n"
+        "        await page.evaluate(() => window.scrollTo(0, document.body.scrollHeight));\n"
+        "        await page.waitForTimeout(500);\n"
+        "        const linksAfter = await page.evaluate(() => {\n"
+        "          const anchors = Array.from(document.querySelectorAll('a[href]'));\n"
+        "          return anchors.map(a => a.href);\n"
+        "        });\n"
+        "        linksAfter.forEach(href => seen.add(href));\n"
+        "        break;\n"
+        "      }\n"
+        "    } else {\n"
+        "      stable = 0;\n"
+        "    }\n"
+        "    prevY = y;\n"
+        "  }\n"
+        "  const allLinks = Array.from(seen);\n"
+        "  const jobLinks = allLinks.filter(url => {\n"
+        "    const path = url.split('?')[0].toLowerCase();\n"
+        "    const isAd = url.includes('sug=') || url.includes('ad=') || url.includes('sponsored');\n"
+        "    return (path.includes('/job-offer/') || path.includes('/szczegoly/praca/') || \n"
+        "           path.includes('/oferta/') || path.includes('/job/') || \n"
+        "           path.includes('/career/') || path.includes('/position/')) && !isAd;\n"
+        "  });\n"
+        "  const uniqueUrls = new Set();\n"
+        "  jobLinks.forEach(url => uniqueUrls.add(url.split('?')[0]));\n"
+        "  return Array.from(uniqueUrls);\n"
+        "}\n\n"
+        "Return ONLY the array of URLs."
     )
 
-    result = await agent.run(user_message)
+    console.print("[subagent][jobboard] Sending task to PydanticAI agent 'jobboard_link_collector'...")
 
-    # Handle both direct list output and JSON string output from agent
+    # For the sandbox, allow generous usage limits so the agent can
+    # freely use MCP tools without hitting the default request_limit.
+    usage_limits = UsageLimits(
+        request_limit=500,
+        tool_calls_limit=200,
+        response_tokens_limit=None,
+    )
+
+    try:
+        result = await agent.run(user_message, usage_limits=usage_limits)
+    except Exception as e:  # guard small model/tool flakiness
+        console.print(f"[subagent][jobboard] Agent failed: {e}", style="red")
+        return []
+
+    console.print("[subagent][jobboard] Agent finished, parsing raw output into list of links...")
+
     raw_output = result.output
     if isinstance(raw_output, str):
         try:
             links = json.loads(raw_output)
         except json.JSONDecodeError:
-            # Try to extract JSON array from string if direct parse fails
             import re
-            match = re.search(r'\[.*\]', raw_output, re.DOTALL)
+
+            match = re.search(r"\[.*\]", raw_output, re.DOTALL)
             if match:
                 try:
                     links = json.loads(match.group(0))
@@ -129,20 +171,93 @@ async def run_sandbox(url: str | None = None) -> None:
     else:
         links = []
 
-    if not links:
-        console.print(Panel("No job links were returned by the agent.", title="Result", style="yellow"))
-        return
+    if not isinstance(links, list):
+        console.print("[subagent][jobboard] Parsed output is not a list, returning empty list of links.")
+        return []
 
-    total = len(links)
-    console.print(Panel(f"Agent returned {total} job links (first 5):", title="Result", style="green"))
+    # Filter links to only keep URLs from the same domain as the jobboard URL
+    jobboard_domain = urlparse(url_to_use).netloc.lower()
+    filtered_links: List[str] = []
+    for link in links:
+        if not isinstance(link, str):
+            continue
+        parsed = urlparse(link)
+        if not parsed.scheme or not parsed.netloc:
+            # Skip relative or malformed URLs
+            continue
+        if parsed.netloc.lower() != jobboard_domain:
+            continue
+        filtered_links.append(link)
 
-    for i, link in enumerate(links[:5], start=1):
-        console.print(f"[{i}] {link}")
+    console.print(
+        f"[subagent][jobboard] Successfully parsed {len(links)} raw links, "
+        f"{len(filtered_links)} links kept after domain filtering for this jobboard."
+    )
+    return filtered_links
+
+
+async def run_jobboards(urls: List[str]) -> None:
+    """Run the jobboard agent for a list of URLs and log results per jobboard."""
+    validate_and_setup_environment()
+
+    console.print("[orchestrator] Starting multi-jobboard scraping pipeline...")
+    console.print(f"[orchestrator] Total jobboards to process: {len(urls)}")
+    console.print("[orchestrator] Max concurrent Playwright instances: 5")
+    console.print("[orchestrator] Link collection limit per jobboard: None (collect all)")
+    console.print("[orchestrator] Starting parallel execution...")
+
+    semaphore = asyncio.Semaphore(5)
+
+    async def _process_jobboard(idx: int, url: str) -> None:
+        async with semaphore:
+            url_to_use = (url or "").strip()
+            if not url_to_use:
+                return
+
+            console.print(f"[orchestrator][jobboard #{idx}] Starting processing...")
+            console.print(f"[orchestrator][jobboard #{idx}] URL: {url_to_use}")
+
+            links = await collect_job_links(url_to_use)
+
+            if not links:
+                console.print(
+                    Panel(
+                        "No job links were returned by the agent.",
+                        title=f"[orchestrator][jobboard #{idx}] Result",
+                        style="yellow",
+                    )
+                )
+                return
+
+            total = len(links)
+            console.print(
+                Panel(
+                    f"Agent returned {total} job links (collecting all, printing first 5):",
+                    title=f"[orchestrator][jobboard #{idx}] Result",
+                    style="green",
+                )
+            )
+
+            console.print(f"[orchestrator][jobboard #{idx}] Total collected: {total} links")
+            console.print(f"[orchestrator][jobboard #{idx}] Showing first 5 links:")
+            for i, link in enumerate(links[:5], start=1):
+                console.print(f"[orchestrator][jobboard #{idx}][{i}] {link}")
+
+            console.print(f"[orchestrator][jobboard #{idx}] Finished processing")
+
+    tasks = [
+        _process_jobboard(idx, url)
+        for idx, url in enumerate(urls, start=1)
+    ]
+
+    if tasks:
+        await asyncio.gather(*tasks)
+
+    console.print("[orchestrator] All jobboards processed. Pipeline complete.")
 
 
 def main() -> None:
-    url = os.getenv("PYDANTIC_SANDBOX_URL", JOB_BOARD_URL)
-    asyncio.run(run_sandbox(url))
+    asyncio.run(run_jobboards(JOBBOARD_URLS))
 
 
 if __name__ == "__main__":
