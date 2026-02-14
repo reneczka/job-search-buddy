@@ -1,6 +1,8 @@
 import asyncio
 import json
 import os
+import shlex
+import traceback
 from typing import List
 from urllib.parse import urlparse
 
@@ -50,9 +52,15 @@ def build_model() -> OpenAIChatModel:
 
 model = build_model()
 
+playwright_mcp_command = os.getenv("PLAYWRIGHT_MCP_COMMAND", "npx")
+playwright_mcp_args = shlex.split(os.getenv("PLAYWRIGHT_MCP_ARGS", "-y @playwright/mcp@latest"))
+
 playwright_server = MCPServerStdio(
-    command="npx",
-    args=["-y", "@playwright/mcp@latest"],
+    command=playwright_mcp_command,
+    args=playwright_mcp_args,
+    env=os.environ.copy(),
+    timeout=120,
+    read_timeout=600,
 )
 
 system_prompt = (
@@ -71,6 +79,20 @@ agent: Agent[None, List[str]] = Agent(
     system_prompt=system_prompt,
     toolsets=[playwright_server],
 )
+
+
+def _log_exception_details(prefix: str, exc: BaseException) -> None:
+    """Print traceback, including nested exceptions from ExceptionGroup."""
+    console.print(f"{prefix}{exc!r}", style="red")
+    console.print("[subagent][jobboard] Full traceback:", style="red")
+    console.print("".join(traceback.format_exception(type(exc), exc, exc.__traceback__)), style="red")
+    if isinstance(exc, BaseExceptionGroup):
+        for idx, sub_exc in enumerate(exc.exceptions, start=1):
+            console.print(f"[subagent][jobboard] Sub-exception #{idx}: {sub_exc!r}", style="red")
+            console.print(
+                "".join(traceback.format_exception(type(sub_exc), sub_exc, sub_exc.__traceback__)),
+                style="red",
+            )
 
 
 async def collect_job_links(url: str) -> List[str]:
@@ -146,7 +168,7 @@ async def collect_job_links(url: str) -> List[str]:
     try:
         result = await agent.run(user_message, usage_limits=usage_limits)
     except Exception as e:  # guard small model/tool flakiness
-        console.print(f"[subagent][jobboard] Agent failed: {e}", style="red")
+        _log_exception_details("[subagent][jobboard] Agent failed: ", e)
         return []
 
     console.print("[subagent][jobboard] Agent finished, parsing raw output into list of links...")
