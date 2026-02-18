@@ -16,7 +16,7 @@ dependencies = [
     "litellm (>=1.67.4.post1,<2)",
     "playwright (>=1.42.1,<2.0.0)",
     "openai-agents[litellm] (>=0.5.0,<0.6.0)",
-    "stagehand (>=0.3.0,<1.0.0)"
+    "stagehand (==3.5.0)"
 ]
 
 
