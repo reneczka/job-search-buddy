@@ -115,6 +115,14 @@ def model_options(
     return {"model": cfg}
 
 
+def scoped_model_options(model_opts: dict[str, Any], selector: Optional[str]) -> dict[str, Any]:
+    if not selector:
+        return model_opts
+    scoped = dict(model_opts)
+    scoped["selector"] = selector
+    return scoped
+
+
 def cleanup_browser_processes() -> None:
     # User explicitly requested aggressive cleanup of stale browser processes.
     patterns = [
@@ -221,6 +229,33 @@ def print_metrics_summary(metrics: Optional[dict[str, Any]]) -> None:
     console.print(f"METRICS_CACHED_INPUT_TOKENS={cached}")
     console.print(f"METRICS_CACHE_RATIO_INPUT_PCT={cache_ratio:.1f}")
     console.print(f"METRICS_INFERENCE_MS={inference_ms}")
+
+
+def print_replay_summary(replay: Any) -> None:
+    try:
+        pages = getattr(getattr(replay, "data", None), "pages", None) or []
+        cached = 0
+        input_tokens = 0
+        output_tokens = 0
+        actions = 0
+        for page in pages:
+            for action in getattr(page, "actions", None) or []:
+                usage = getattr(action, "token_usage", None)
+                if usage is None:
+                    continue
+                actions += 1
+                cached += int(getattr(usage, "cached_input_tokens", 0) or 0)
+                input_tokens += int(getattr(usage, "input_tokens", 0) or 0)
+                output_tokens += int(getattr(usage, "output_tokens", 0) or 0)
+        total_input = cached + input_tokens
+        ratio = (100.0 * cached / total_input) if total_input > 0 else 0.0
+        console.print(f"STAGEHAND_REPLAY_ACTIONS={actions}")
+        console.print(f"STAGEHAND_REPLAY_CACHED_INPUT_TOKENS={cached}")
+        console.print(f"STAGEHAND_REPLAY_INPUT_TOKENS={input_tokens}")
+        console.print(f"STAGEHAND_REPLAY_OUTPUT_TOKENS={output_tokens}")
+        console.print(f"STAGEHAND_REPLAY_CACHE_RATIO_INPUT_PCT={ratio:.1f}")
+    except Exception:
+        console.print("STAGEHAND_REPLAY_METRICS=unavailable")
 
 
 class OfferUrls(BaseModel):
@@ -486,6 +521,7 @@ async def extract_offer_seed_urls_with_llm(
     pw_page: Page,
     model_opts: dict[str, Any],
     domain: str,
+    listing_selector: Optional[str] = None,
 ) -> list[str]:
     if hasattr(session, "should_skip") and session.should_skip("extract"):
         return []
@@ -496,7 +532,7 @@ async def extract_offer_seed_urls_with_llm(
                 "Exclude categories, filters, login, account, blog, salary pages, sponsored/promoted/recommended blocks."
             ),
             schema=OfferUrls.model_json_schema(),
-            options=model_opts,
+            options=scoped_model_options(model_opts, listing_selector),
             page=pw_page,
         )
         payload = getattr(extracted.data, "result", None)
@@ -679,6 +715,32 @@ def choose_reveal_action(actions: list[dict[str, Any]]) -> Optional[dict[str, An
     return best if best_score >= 2 else None
 
 
+async def discover_listing_selector(
+    session: Any,
+    pw_page: Page,
+    model_opts: dict[str, Any],
+) -> Optional[str]:
+    if hasattr(session, "should_skip") and session.should_skip("observe"):
+        return None
+    try:
+        observed = await session.observe(
+            instruction=(
+                "Find one safe click action inside the main job-results listing area (not header/footer/sidebar). "
+                "Return one action."
+            ),
+            options=model_opts,
+            page=pw_page,
+        )
+        actions = as_action_dicts(getattr(observed.data, "result", []) or [])
+        for action in actions:
+            selector = str(action.get("selector") or "").strip()
+            if selector:
+                return selector
+    except Exception:
+        return None
+    return None
+
+
 async def accept_cookies(
     session: Any,
     pw_page: Page,
@@ -736,26 +798,29 @@ async def extract_offer_urls(
     model_opts: dict[str, Any],
     domain: str,
     inferred_pattern: Optional[OfferPattern] = None,
+    listing_selector: Optional[str] = None,
+    use_llm_extract: bool = True,
 ) -> list[str]:
     urls: list[str] = []
     card_urls: list[str] = []
-    try:
-        extracted = await session.extract(
-            instruction=(
-                "Extract visible URLs for real job offer detail pages from current listing results. "
-                "Exclude sponsored/promoted/recommended blocks and nav/filter/login/share links."
-            ),
-            schema=OfferUrls.model_json_schema(),
-            options=model_opts,
-            page=pw_page,
-        )
-        payload = getattr(extracted.data, "result", None)
-        if isinstance(payload, dict):
-            raw = payload.get("urls")
-            if isinstance(raw, list):
-                urls.extend([u for u in raw if isinstance(u, str)])
-    except Exception:
-        pass
+    if use_llm_extract:
+        try:
+            extracted = await session.extract(
+                instruction=(
+                    "Extract visible URLs for real job offer detail pages from current listing results. "
+                    "Exclude sponsored/promoted/recommended blocks and nav/filter/login/share links."
+                ),
+                schema=OfferUrls.model_json_schema(),
+                options=scoped_model_options(model_opts, listing_selector),
+                page=pw_page,
+            )
+            payload = getattr(extracted.data, "result", None)
+            if isinstance(payload, dict):
+                raw = payload.get("urls")
+                if isinstance(raw, list):
+                    urls.extend([u for u in raw if isinstance(u, str)])
+        except Exception:
+            pass
 
     try:
         dom_urls = await pw_page.evaluate(
@@ -1003,6 +1068,7 @@ async def collect_offers(
 ) -> list[str]:
     seen: set[str] = set()
     inferred_pattern: Optional[OfferPattern] = None
+    listing_selector: Optional[str] = None
     expected_from_header: Optional[int] = None
     visited_pages: set[str] = set()
     queued_pages: list[str] = []
@@ -1010,6 +1076,7 @@ async def collect_offers(
     stagnation = 0
     step = 0
     last_listing_url = normalize_page_url(target_url)
+    cookie_checked = False
 
     while True:
         step_started = time.perf_counter()
@@ -1018,7 +1085,9 @@ async def collect_offers(
             console.print(f"STOP_REASON=safety_step_limit_{SAFETY_STEP_LIMIT}")
             break
 
-        await accept_cookies(session, pw_page, model_opts)
+        if not cookie_checked:
+            await accept_cookies(session, pw_page, model_opts)
+            cookie_checked = True
         header_on_current = await read_results_header_count(pw_page)
         if header_on_current is not None:
             last_listing_url = normalize_page_url(pw_page.url)
@@ -1030,7 +1099,9 @@ async def collect_offers(
             if current_norm != last_listing_url:
                 await session.navigate(url=last_listing_url, page=pw_page)
                 await sleep_ms(1200)
-                await accept_cookies(session, pw_page, model_opts)
+                if not cookie_checked:
+                    await accept_cookies(session, pw_page, model_opts)
+                    cookie_checked = True
                 console.print(f"RECOVER_TO_LISTING={last_listing_url}")
                 continue
 
@@ -1038,18 +1109,26 @@ async def collect_offers(
         visited_pages.add(current_page)
 
         before = len(seen)
-        seed_urls = await extract_offer_seed_urls_with_llm(
-            session=session,
-            pw_page=pw_page,
-            model_opts=model_opts,
-            domain=domain,
-        )
+        if listing_selector is None:
+            listing_selector = await discover_listing_selector(session, pw_page, model_opts)
+
+        seed_urls: list[str] = []
+        if inferred_pattern is None:
+            seed_urls = await extract_offer_seed_urls_with_llm(
+                session=session,
+                pw_page=pw_page,
+                model_opts=model_opts,
+                domain=domain,
+                listing_selector=listing_selector,
+            )
         raw_extracted = await extract_offer_urls(
             session=session,
             pw_page=pw_page,
             model_opts=model_opts,
             domain=domain,
             inferred_pattern=None,
+            listing_selector=listing_selector,
+            use_llm_extract=(inferred_pattern is None),
         )
         if not seed_urls and raw_extracted:
             seed_urls = await filter_offer_candidates_with_llm(
@@ -1125,11 +1204,15 @@ async def collect_offers(
             if next_url:
                 await session.navigate(url=next_url, page=pw_page)
                 await sleep_ms(1400)
-                await accept_cookies(session, pw_page, model_opts)
+                if not cookie_checked:
+                    await accept_cookies(session, pw_page, model_opts)
+                    cookie_checked = True
                 if await read_results_header_count(pw_page) is None:
                     await session.navigate(url=last_listing_url, page=pw_page)
                     await sleep_ms(900)
-                    await accept_cookies(session, pw_page, model_opts)
+                    if not cookie_checked:
+                        await accept_cookies(session, pw_page, model_opts)
+                        cookie_checked = True
                     console.print(f"RECOVER_TO_LISTING={last_listing_url}")
                     moved = False
                     continue
@@ -1148,7 +1231,9 @@ async def collect_offers(
             if llm_next:
                 await session.navigate(url=llm_next, page=pw_page)
                 await sleep_ms(1200)
-                await accept_cookies(session, pw_page, model_opts)
+                if not cookie_checked:
+                    await accept_cookies(session, pw_page, model_opts)
+                    cookie_checked = True
                 moved = True
                 console.print(f"PAGINATION_GOTO_LLM={llm_next}")
 
@@ -1238,9 +1323,12 @@ async def run_stagehand_protocol_min() -> None:
         await sleep_ms(1500)
         await accept_cookies(session, pw_page, model_opts)
 
-        cache_probe_started = time.perf_counter()
-        await run_cache_probe(session, pw_page, model_name, cache_enabled)
-        console.print(f"CACHE_PROBE_MS={int((time.perf_counter() - cache_probe_started) * 1000)}")
+        if env_flag("STAGEHAND_CACHE_PROBE", "false"):
+            cache_probe_started = time.perf_counter()
+            await run_cache_probe(session, pw_page, model_name, cache_enabled)
+            console.print(f"CACHE_PROBE_MS={int((time.perf_counter() - cache_probe_started) * 1000)}")
+        else:
+            console.print("CACHE_PROBE=disabled")
 
         domain = urlsplit(target_url).netloc
         collect_started = time.perf_counter()
@@ -1265,6 +1353,11 @@ async def run_stagehand_protocol_min() -> None:
             browserbase_project_id=client.browserbase_project_id,
         )
         print_metrics_summary(metrics)
+        try:
+            replay = await client.sessions.replay(raw_session.id)
+            print_replay_summary(replay)
+        except Exception:
+            console.print("STAGEHAND_REPLAY_METRICS=unavailable")
         console.print(f"RUN_TOTAL_MS={int((time.perf_counter() - started) * 1000)}")
     finally:
         if isinstance(session, LoggedStagehandSession):
