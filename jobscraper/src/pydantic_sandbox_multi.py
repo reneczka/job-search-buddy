@@ -23,7 +23,11 @@ console = Console()
 
 JUSTJOIN_POC_URL = "https://justjoin.it/job-offers/all-locations/python?experience-level=junior&orderBy=DESC&sortBy=newest"
 PROTOCOL_POC_URL = "https://theprotocol.it/filtry/python;t/trainee,assistant,junior;p?sort=date"
+NOFLUFF_POC_URL = "https://nofluffjobs.com/pl/Python?lang=en&criteria=seniority%3Dtrainee,junior&sort=newest"
 JJ_FIRST_VISIBLE_OFFER_URL = "https://justjoin.it/job-offer/epam-systems-python-engineering-trainee-poland-remote--python"
+NF_FIRST_VISIBLE_OFFER_URL = (
+    "https://nofluffjobs.com/pl/job/software-engineer-early-careers-programme-tesco-technology-krakow"
+)
 TRUTHY = {"1", "true", "yes"}
 SAFETY_STEP_LIMIT = 250
 
@@ -38,9 +42,9 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Universal multi-board Stagehand scraper.")
     parser.add_argument(
         "--site",
-        choices=["all", "justjoin", "theprotocol"],
+        choices=["all", "justjoin", "theprotocol", "nofluffjobs"],
         default="all",
-        help="Run one site or both sites in a single execution.",
+        help="Run one site or all supported sites in a single execution.",
     )
     return parser.parse_args()
 
@@ -49,6 +53,7 @@ def selected_targets(site: str) -> list[TargetBoard]:
     all_targets = [
         TargetBoard(name="justjoin", url=JUSTJOIN_POC_URL),
         TargetBoard(name="theprotocol", url=PROTOCOL_POC_URL),
+        TargetBoard(name="nofluffjobs", url=NOFLUFF_POC_URL),
     ]
     if site == "all":
         return all_targets
@@ -150,6 +155,8 @@ def is_offer_candidate_url(url: str, domain: str) -> bool:
         return path.startswith("/job-offer/")
     if domain_norm == "theprotocol.it":
         return path.startswith("/szczegoly/praca/")
+    if domain_norm == "nofluffjobs.com":
+        return path.startswith("/pl/job/")
     return True
 
 
@@ -454,9 +461,17 @@ def matches_offer_pattern(url: str, pattern: Optional[OfferPattern]) -> bool:
     if pattern is None:
         return True
     path = (urlsplit(url).path or "").lower()
-    if pattern.include_tokens and not all(token in path for token in pattern.include_tokens):
+    def has_token(token: str) -> bool:
+        tok = token.strip().lower()
+        if not tok:
+            return False
+        # Keep permissive matching for inferred tokens: some boards encode
+        # signal words inside slug fragments (e.g. "... ,oferta, ...").
+        return tok in path
+
+    if pattern.include_tokens and not all(has_token(token) for token in pattern.include_tokens):
         return False
-    if pattern.exclude_tokens and any(token in path for token in pattern.exclude_tokens):
+    if pattern.exclude_tokens and any(has_token(token) for token in pattern.exclude_tokens):
         return False
     return True
 
@@ -943,6 +958,10 @@ async def extract_offer_urls(
                   if (!t) continue;
                   const matches = t.match(/https?:\\/\\/[^"'\\s<>]+|\\/[a-zA-Z0-9_\\-\\/.,%]+/g) || [];
                   for (const m of matches) pushUrl(m);
+                  const escapedMatches = t.match(/\\\\\\/pl\\\\\\/job\\\\\\/[a-zA-Z0-9\\-]+/g) || [];
+                  for (const m of escapedMatches) {
+                    pushUrl(m.replace(/\\\\\\//g, "/"));
+                  }
                 }
                 return out.slice(0, 5000);
             }"""
@@ -975,6 +994,8 @@ async def extract_offer_urls(
             candidate = urljoin(pw_page.url, candidate)
         normalized = normalize_offer_url(candidate)
         if not normalized or not is_offer_candidate_url(normalized, domain):
+            continue
+        if inferred_pattern is not None and not matches_offer_pattern(normalized, inferred_pattern):
             continue
         if normalized in seen:
             continue
@@ -1072,6 +1093,34 @@ async def reveal_more(
         except Exception:
             pass
 
+    # Fast DOM fallback before using execute(): click likely "next/load more" controls.
+    try:
+        clicked = await pw_page.evaluate(
+            """() => {
+                const labels = ["load more", "show more", "more", "next", "więcej", "pokaż", "dalej"];
+                const nodes = Array.from(document.querySelectorAll("button, a[role='button'], [role='button']"));
+                for (const el of nodes) {
+                  const txt = ((el.textContent || "") + " " + (el.getAttribute("aria-label") || ""))
+                    .trim()
+                    .toLowerCase()
+                    .replace(/\\s+/g, " ");
+                  if (!txt) continue;
+                  if (!labels.some((label) => txt.includes(label))) continue;
+                  const disabled = el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true";
+                  if (disabled) continue;
+                  el.click();
+                  return true;
+                }
+                return false;
+            }"""
+        )
+        if clicked:
+            await sleep_ms(1200)
+            after = await listing_signature(pw_page)
+            return after != before
+    except Exception:
+        pass
+
     # Native Stagehand cache path: execute() + should_cache.
     try:
         await session.execute(
@@ -1139,8 +1188,13 @@ async def collect_offers(
     listing_family_name = path_family(urlsplit(target_url).path)
     cookie_checked = False
     max_stagnation = 8 if board_name == "justjoin" else 10
+    initial_offer_url = ""
     if board_name == "justjoin":
-        inferred_pattern = infer_offer_pattern_from_url(env_str("STAGEHAND_FIRST_OFFER_URL", JJ_FIRST_VISIBLE_OFFER_URL))
+        initial_offer_url = JJ_FIRST_VISIBLE_OFFER_URL
+    elif board_name == "nofluffjobs":
+        initial_offer_url = NF_FIRST_VISIBLE_OFFER_URL
+    if initial_offer_url:
+        inferred_pattern = infer_offer_pattern_from_url(env_str("STAGEHAND_FIRST_OFFER_URL", initial_offer_url))
         if inferred_pattern:
             console.print(f"FIRST_GOOD_OFFER_URL={inferred_pattern.first_url}")
             console.print(f"OFFER_URL_PATTERN_INCLUDE_TOKENS={','.join(inferred_pattern.include_tokens) or '-'}")
@@ -1328,7 +1382,8 @@ async def collect_offers(
         if stagnation >= max_stagnation:
             console.print("STOP_REASON=stagnation")
             break
-        if not moved and not queued_pages and stagnation >= 2:
+        no_more_actions_threshold = 4 if board_name == "nofluffjobs" else 2
+        if not moved and not queued_pages and stagnation >= no_more_actions_threshold:
             console.print("STOP_REASON=no_more_actions")
             break
 
