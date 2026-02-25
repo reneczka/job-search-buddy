@@ -24,10 +24,14 @@ console = Console()
 JUSTJOIN_POC_URL = "https://justjoin.it/job-offers/all-locations/python?experience-level=junior&orderBy=DESC&sortBy=newest"
 PROTOCOL_POC_URL = "https://theprotocol.it/filtry/python;t/trainee,assistant,junior;p?sort=date"
 NOFLUFF_POC_URL = "https://nofluffjobs.com/pl/Python?lang=en&criteria=seniority%3Dtrainee,junior&sort=newest"
+BULLDOG_POC_URL = (
+    "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
+)
 JJ_FIRST_VISIBLE_OFFER_URL = "https://justjoin.it/job-offer/epam-systems-python-engineering-trainee-poland-remote--python"
 NF_FIRST_VISIBLE_OFFER_URL = (
     "https://nofluffjobs.com/pl/job/software-engineer-early-careers-programme-tesco-technology-krakow"
 )
+BD_FIRST_VISIBLE_OFFER_URL = "https://bulldogjob.pl/companies/jobs/230066-project-manager-ai-and-innovation-warsaw-teamquest"
 TRUTHY = {"1", "true", "yes"}
 SAFETY_STEP_LIMIT = 250
 
@@ -42,7 +46,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Universal multi-board Stagehand scraper.")
     parser.add_argument(
         "--site",
-        choices=["all", "justjoin", "theprotocol", "nofluffjobs"],
+        choices=["all", "justjoin", "theprotocol", "nofluffjobs", "bulldogjob"],
         default="all",
         help="Run one site or all supported sites in a single execution.",
     )
@@ -54,6 +58,7 @@ def selected_targets(site: str) -> list[TargetBoard]:
         TargetBoard(name="justjoin", url=JUSTJOIN_POC_URL),
         TargetBoard(name="theprotocol", url=PROTOCOL_POC_URL),
         TargetBoard(name="nofluffjobs", url=NOFLUFF_POC_URL),
+        TargetBoard(name="bulldogjob", url=env_str("STAGEHAND_POC_URL", BULLDOG_POC_URL)),
     ]
     if site == "all":
         return all_targets
@@ -157,6 +162,14 @@ def is_offer_candidate_url(url: str, domain: str) -> bool:
         return path.startswith("/szczegoly/praca/")
     if domain_norm == "nofluffjobs.com":
         return path.startswith("/pl/job/")
+    if domain_norm == "bulldogjob.pl":
+        # Final offer pages are /companies/jobs/{id-slug}; exclude listing/search pages.
+        if not path.startswith("/companies/jobs/"):
+            return False
+        tail = parts[2] if len(parts) >= 3 else ""
+        if not tail or tail == "s":
+            return False
+        return bool(re.search(r"\d", tail) and "-" in tail)
     return True
 
 
@@ -1193,6 +1206,8 @@ async def collect_offers(
         initial_offer_url = JJ_FIRST_VISIBLE_OFFER_URL
     elif board_name == "nofluffjobs":
         initial_offer_url = NF_FIRST_VISIBLE_OFFER_URL
+    elif board_name == "bulldogjob":
+        initial_offer_url = BD_FIRST_VISIBLE_OFFER_URL
     if initial_offer_url:
         inferred_pattern = infer_offer_pattern_from_url(env_str("STAGEHAND_FIRST_OFFER_URL", initial_offer_url))
         if inferred_pattern:
@@ -1218,7 +1233,11 @@ async def collect_offers(
                 console.print(f"HEADER_OFFERS_COUNT={expected_from_header}")
         else:
             current_norm = normalize_page_url(pw_page.url)
-            if current_norm != last_listing_url:
+            # Some boards have pagination pages without a visible header count.
+            # Keep those pages when they still belong to the same listing family.
+            if is_same_listing_family(current_norm, domain, listing_family_name):
+                last_listing_url = current_norm
+            elif current_norm != last_listing_url:
                 await session.navigate(url=last_listing_url, page=pw_page)
                 await sleep_ms(1200)
                 if not cookie_checked:
