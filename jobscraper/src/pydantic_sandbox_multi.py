@@ -1,5 +1,6 @@
 import argparse
 import asyncio
+from collections import Counter
 from dataclasses import dataclass
 import os
 import re
@@ -27,6 +28,7 @@ NOFLUFF_POC_URL = "https://nofluffjobs.com/pl/Python?lang=en&criteria=seniority%
 BULLDOG_POC_URL = (
     "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
 )
+PRACUJ_POC_URL = "https://it.pracuj.pl/praca?et=1%2C3%2C17&sc=0&itth=37"
 JJ_FIRST_VISIBLE_OFFER_URL = "https://justjoin.it/job-offer/epam-systems-python-engineering-trainee-poland-remote--python"
 NF_FIRST_VISIBLE_OFFER_URL = (
     "https://nofluffjobs.com/pl/job/software-engineer-early-careers-programme-tesco-technology-krakow"
@@ -46,7 +48,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Universal multi-board Stagehand scraper.")
     parser.add_argument(
         "--site",
-        choices=["all", "justjoin", "theprotocol", "nofluffjobs", "bulldogjob"],
+        choices=["all", "justjoin", "theprotocol", "nofluffjobs", "bulldogjob", "pracuj"],
         default="all",
         help="Run one site or all supported sites in a single execution.",
     )
@@ -59,6 +61,7 @@ def selected_targets(site: str) -> list[TargetBoard]:
         TargetBoard(name="theprotocol", url=PROTOCOL_POC_URL),
         TargetBoard(name="nofluffjobs", url=NOFLUFF_POC_URL),
         TargetBoard(name="bulldogjob", url=env_str("STAGEHAND_POC_URL", BULLDOG_POC_URL)),
+        TargetBoard(name="pracuj", url=PRACUJ_POC_URL),
     ]
     if site == "all":
         return all_targets
@@ -79,6 +82,11 @@ def debug_enabled() -> bool:
 
 def normalize_domain(domain: str) -> str:
     return domain.lower().removeprefix("www.")
+
+
+def is_pracuj_domain(domain: str) -> bool:
+    normalized = normalize_domain(domain)
+    return normalized == "pracuj.pl" or normalized.endswith(".pracuj.pl")
 
 
 def normalize_offer_url(url: str) -> str:
@@ -170,6 +178,8 @@ def is_offer_candidate_url(url: str, domain: str) -> bool:
         if not tail or tail == "s":
             return False
         return bool(re.search(r"\d", tail) and "-" in tail)
+    if is_pracuj_domain(domain_norm):
+        return path.startswith("/praca/") and ",oferta," in path
     return True
 
 
@@ -493,6 +503,24 @@ async def sleep_ms(ms: int) -> None:
     await asyncio.sleep(ms / 1000)
 
 
+def normalize_pracuj_offer_url(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
+
+
+def is_pracuj_offer_url(url: str, domain: str) -> bool:
+    try:
+        parsed = urlsplit(url)
+    except Exception:
+        return False
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if not is_pracuj_domain(parsed.netloc):
+        return False
+    path = parsed.path.rstrip("/")
+    return path.startswith("/praca/") and ",oferta," in path
+
+
 async def listing_signature(pw_page: Page) -> str:
     try:
         payload = await pw_page.evaluate(
@@ -802,6 +830,18 @@ def choose_reveal_action(actions: list[dict[str, Any]]) -> Optional[dict[str, An
     return best if best_score >= 2 else None
 
 
+def merge_unique_urls(*groups: list[str]) -> list[str]:
+    merged: list[str] = []
+    seen: set[str] = set()
+    for group in groups:
+        for url in group:
+            if url in seen:
+                continue
+            seen.add(url)
+            merged.append(url)
+    return merged
+
+
 async def discover_listing_selector(
     session: Any,
     pw_page: Page,
@@ -877,6 +917,326 @@ async def accept_cookies(
         return bool(clicked)
     except Exception:
         return False
+
+
+async def dismiss_pracuj_popups(pw_page: Page) -> None:
+    for label in ("Zamknij", "Akceptuj wszystkie"):
+        try:
+            button = pw_page.get_by_role("button", name=label)
+            if await button.count():
+                await button.first.click(timeout=1500)
+                await sleep_ms(400)
+        except Exception:
+            pass
+
+
+async def collect_pracuj_visible_offer_urls(
+    pw_page: Page,
+    domain: str,
+    selector: str = "#offers-list a[href]",
+) -> list[str]:
+    try:
+        raw = await pw_page.evaluate(
+            """(selector) => {
+                const visible = (el) => {
+                  const style = window.getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  return style.display !== "none"
+                    && style.visibility !== "hidden"
+                    && rect.width > 0
+                    && rect.height > 0;
+                };
+                const toAbs = (value) => {
+                  try {
+                    return new URL(value, window.location.href).toString();
+                  } catch {
+                    return "";
+                  }
+                };
+                return Array.from(document.querySelectorAll(selector))
+                  .filter((el) => visible(el))
+                  .map((el) => toAbs(el.getAttribute("href") || el.href || ""))
+                  .filter(Boolean);
+            }""",
+            selector,
+        )
+    except Exception:
+        raw = []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, str):
+            continue
+        normalized = normalize_pracuj_offer_url(entry)
+        if not normalized or not is_pracuj_offer_url(normalized, domain):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+async def collect_pracuj_visible_offer_cards(
+    pw_page: Page,
+    domain: str,
+) -> list[dict[str, str]]:
+    try:
+        raw = await pw_page.evaluate(
+            """() => {
+                const visible = (el) => {
+                  const style = window.getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  return style.display !== "none"
+                    && style.visibility !== "hidden"
+                    && rect.width > 0
+                    && rect.height > 0;
+                };
+                const toAbs = (value) => {
+                  try {
+                    return new URL(value, window.location.href).toString();
+                  } catch {
+                    return "";
+                  }
+                };
+                return Array.from(document.querySelectorAll('#offers-list [data-test="default-offer"]'))
+                  .filter((card) => visible(card))
+                  .map((card) => {
+                    const titleLink = card.querySelector('a[data-test="link-offer-title"]');
+                    const offerLink = card.querySelector('a[data-test="link-offer"]');
+                    const titleNode = card.querySelector('[data-test="offer-title"]');
+                    return {
+                      offerId: card.getAttribute('data-test-offerid') || "",
+                      title: (titleNode?.textContent || "").trim(),
+                      titleLink: toAbs(titleLink?.getAttribute("href") || titleLink?.href || ""),
+                      offerLink: toAbs(offerLink?.getAttribute("href") || offerLink?.href || ""),
+                    };
+                  });
+            }"""
+        )
+    except Exception:
+        raw = []
+
+    out: list[dict[str, str]] = []
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        offer_id = str(entry.get("offerId") or "").strip()
+        title = str(entry.get("title") or "").strip()
+        title_link = normalize_pracuj_offer_url(str(entry.get("titleLink") or "").strip())
+        offer_link = normalize_pracuj_offer_url(str(entry.get("offerLink") or "").strip())
+        url = title_link or offer_link
+        if url and not is_pracuj_offer_url(url, domain):
+            url = ""
+        out.append({"offer_id": offer_id, "title": title, "url": url})
+    return out
+
+
+async def extract_pracuj_next_data_offer_urls(
+    pw_page: Page,
+    domain: str,
+) -> dict[str, str]:
+    try:
+        raw = await pw_page.evaluate(
+            """() => {
+                const script = document.getElementById("__NEXT_DATA__");
+                if (!script?.textContent) return [];
+                const data = JSON.parse(script.textContent);
+                const grouped = data?.props?.pageProps?.dehydratedState?.queries?.[0]?.state?.data?.groupedOffers || [];
+                const out = [];
+                for (const group of grouped) {
+                  for (const offer of group?.offers || []) {
+                    if (!offer?.partitionId || !offer?.offerAbsoluteUri) continue;
+                    out.push({
+                      offerId: String(offer.partitionId),
+                      url: String(offer.offerAbsoluteUri),
+                    });
+                  }
+                }
+                return out;
+            }"""
+        )
+    except Exception:
+        raw = []
+
+    out: dict[str, str] = {}
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        offer_id = str(entry.get("offerId") or "").strip()
+        url = normalize_pracuj_offer_url(str(entry.get("url") or "").strip())
+        if not offer_id or not url or not is_pracuj_offer_url(url, domain):
+            continue
+        out.setdefault(offer_id, url)
+    return out
+
+
+async def collect_pracuj_page_offer_urls(
+    pw_page: Page,
+    domain: str,
+    selector: Optional[str],
+) -> tuple[list[str], int]:
+    cards = await collect_pracuj_visible_offer_cards(pw_page, domain)
+    next_data_urls = await extract_pracuj_next_data_offer_urls(pw_page, domain)
+    selector_urls = await collect_pracuj_visible_offer_urls(pw_page, domain, selector) if selector else []
+    selector_by_id: dict[str, str] = {}
+    for url in selector_urls:
+        path = urlsplit(url).path
+        offer_id = path.split(",oferta,")[-1] if ",oferta," in path else ""
+        offer_id = offer_id.split("/")[0]
+        if offer_id:
+            selector_by_id.setdefault(offer_id, url)
+
+    urls: list[str] = []
+    seen: set[str] = set()
+    for card in cards:
+        offer_id = card["offer_id"]
+        candidate = card["url"] or selector_by_id.get(offer_id, "") or next_data_urls.get(offer_id, "")
+        if not candidate:
+            continue
+        normalized = normalize_pracuj_offer_url(candidate)
+        if not normalized or not is_pracuj_offer_url(normalized, domain):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        urls.append(normalized)
+    return urls, len(cards)
+
+
+async def has_pracuj_next_page(pw_page: Page) -> bool:
+    try:
+        return await pw_page.evaluate(
+            """() => {
+                const btn = document.querySelector('[data-test="top-pagination-next-button"], [data-test="bottom-pagination-button-next"]');
+                if (!btn) return false;
+                const disabled = btn.hasAttribute('disabled') || btn.getAttribute("aria-disabled") === "true";
+                return !disabled;
+            }"""
+        )
+    except Exception:
+        return False
+
+
+async def goto_pracuj_next_page(pw_page: Page) -> bool:
+    try:
+        button = pw_page.locator('[data-test="top-pagination-next-button"]').first
+        if await button.count() == 0:
+            button = pw_page.locator('[data-test="bottom-pagination-button-next"]').first
+        if await button.count() == 0:
+            return False
+        before = pw_page.url
+        await button.click()
+        await sleep_ms(2200)
+        return pw_page.url != before
+    except Exception:
+        return False
+
+
+async def infer_pracuj_selector_from_first_offer(
+    pw_page: Page,
+    first_url: str,
+) -> Optional[str]:
+    try:
+        payload = await pw_page.evaluate(
+            """(firstUrl) => {
+                const visible = (el) => {
+                  const style = window.getComputedStyle(el);
+                  const rect = el.getBoundingClientRect();
+                  return style.display !== "none"
+                    && style.visibility !== "hidden"
+                    && rect.width > 0
+                    && rect.height > 0;
+                };
+                const normalize = (value) => {
+                  try {
+                    const url = new URL(value, window.location.href);
+                    url.hash = "";
+                    return url.toString();
+                  } catch {
+                    return "";
+                  }
+                };
+                const anchors = Array.from(document.querySelectorAll("#offers-list a[href]"))
+                  .filter((el) => visible(el))
+                  .filter((el) => normalize(el.getAttribute("href") || el.href || "") === firstUrl);
+                return anchors.map((el) => ({
+                  dataTest: el.getAttribute("data-test") || "",
+                  dataTestId: el.getAttribute("data-testid") || "",
+                  textLength: (el.textContent || "").trim().length,
+                }));
+            }""",
+            first_url,
+        )
+    except Exception:
+        payload = []
+
+    matches = payload if isinstance(payload, list) else []
+    if not matches:
+        return None
+
+    text_first_matches = [
+        item for item in matches
+        if isinstance(item, dict) and int(item.get("textLength") or 0) > 0 and item.get("dataTest")
+    ]
+    if text_first_matches:
+        best = max(text_first_matches, key=lambda item: int(item.get("textLength") or 0))
+        return f'#offers-list a[data-test="{str(best.get("dataTest")).strip()}"]'
+
+    data_test = Counter(
+        item.get("dataTest", "").strip()
+        for item in matches
+        if isinstance(item, dict) and item.get("dataTest")
+    )
+    if data_test:
+        return f'#offers-list a[data-test="{data_test.most_common(1)[0][0]}"]'
+
+    data_test_id = Counter(
+        item.get("dataTestId", "").strip()
+        for item in matches
+        if isinstance(item, dict) and item.get("dataTestId")
+    )
+    if data_test_id:
+        return f'#offers-list a[data-testid="{data_test_id.most_common(1)[0][0]}"]'
+
+    path = urlsplit(first_url).path
+    if ",oferta," in path:
+        return '#offers-list a[href*=",oferta,"]'
+    if path:
+        return f'#offers-list a[href*="{path}"]'
+    return None
+
+
+async def extract_pracuj_visible_offer_urls(
+    session: Any,
+    pw_page: Page,
+    model_opts: dict[str, Any],
+    domain: str,
+) -> tuple[list[str], Optional[OfferPattern], Optional[str], int]:
+    raw_candidates = await collect_pracuj_visible_offer_urls(pw_page, domain)
+    first_url = raw_candidates[0] if raw_candidates else ""
+
+    inferred_pattern = await infer_offer_pattern_with_llm(
+        session=session,
+        pw_page=pw_page,
+        model_opts=model_opts,
+        domain=domain,
+        candidate_urls=raw_candidates,
+    )
+    if inferred_pattern is None and first_url:
+        inferred_pattern = infer_offer_pattern_from_url(first_url)
+
+    selector = await infer_pracuj_selector_from_first_offer(
+        pw_page=pw_page,
+        first_url=inferred_pattern.first_url if inferred_pattern else first_url,
+    )
+    page_urls, visible_cards_count = await collect_pracuj_page_offer_urls(
+        pw_page=pw_page,
+        domain=domain,
+        selector=selector,
+    )
+    return page_urls, inferred_pattern, selector, visible_cards_count
 
 
 async def extract_offer_urls(
@@ -1178,6 +1538,74 @@ async def run_cache_probe(session: Any, pw_page: Page, model_name: str, cache_en
         console.print("CACHE_PROBE=unavailable")
 
 
+async def collect_pracuj_offers(
+    session: Any,
+    pw_page: Page,
+    model_opts: dict[str, Any],
+    domain: str,
+) -> list[str]:
+    await accept_cookies(session, pw_page, model_opts)
+    await dismiss_pracuj_popups(pw_page)
+    await accept_cookies(session, pw_page, model_opts)
+
+    offers: list[str] = []
+    inferred_pattern: Optional[OfferPattern] = None
+    selector: Optional[str] = None
+    raw_count = 0
+    for attempt in range(1, 5):
+        offers, inferred_pattern, selector, raw_count = await extract_pracuj_visible_offer_urls(
+            session=session,
+            pw_page=pw_page,
+            model_opts=model_opts,
+            domain=domain,
+        )
+        console.print(
+            f"ATTEMPT={attempt} RAW_CANDIDATE_COUNT={raw_count} "
+            f"FOUND_URLS_COUNT={len(offers)} PAGE={pw_page.url}"
+        )
+        if offers:
+            break
+        await sleep_ms(1200)
+
+    all_offers: list[str] = []
+    seen_offers: set[str] = set()
+    page_index = 1
+    current_page_offers = offers
+    current_page_cards = raw_count
+    while True:
+        for offer in current_page_offers:
+            if offer in seen_offers:
+                continue
+            seen_offers.add(offer)
+            all_offers.append(offer)
+        console.print(
+            f"PAGE_INDEX={page_index} VISIBLE_CARDS_COUNT={current_page_cards} "
+            f"PAGE_FOUND_URLS_COUNT={len(current_page_offers)} TOTAL_FOUND_URLS_COUNT={len(all_offers)} "
+            f"PAGE={pw_page.url}"
+        )
+        if not await has_pracuj_next_page(pw_page):
+            break
+        moved = await goto_pracuj_next_page(pw_page)
+        if not moved:
+            break
+        current_page_offers, _, _, current_page_cards = await extract_pracuj_visible_offer_urls(
+            session=session,
+            pw_page=pw_page,
+            model_opts=model_opts,
+            domain=domain,
+        )
+        page_index += 1
+
+    if inferred_pattern:
+        console.print(f"FIRST_GOOD_OFFER_URL={inferred_pattern.first_url}")
+        console.print(f"OFFER_URL_PATTERN_INCLUDE_TOKENS={','.join(inferred_pattern.include_tokens) or '-'}")
+        console.print(f"OFFER_URL_PATTERN_EXCLUDE_TOKENS={','.join(inferred_pattern.exclude_tokens) or '-'}")
+    if selector:
+        console.print(f"JOB_LINK_SELECTOR={selector}", markup=False)
+
+    return all_offers
+
+
 async def collect_offers(
     session: Any,
     pw_page: Page,
@@ -1188,6 +1616,14 @@ async def collect_offers(
     target_url: str,
     board_name: str,
 ) -> list[str]:
+    if board_name == "pracuj":
+        return await collect_pracuj_offers(
+            session=session,
+            pw_page=pw_page,
+            model_opts=model_opts,
+            domain=domain,
+        )
+
     seen: set[str] = set()
     inferred_pattern: Optional[OfferPattern] = None
     listing_selector: Optional[str] = None
@@ -1271,6 +1707,20 @@ async def collect_offers(
             listing_selector=listing_selector,
             use_llm_extract=(inferred_pattern is None and board_name != "justjoin"),
         )
+        if board_name == "nofluffjobs":
+            # No Fluff sometimes renders the last loaded card a beat later than the
+            # first extraction pass. A quick DOM-only retry makes the count stable.
+            await sleep_ms(1200)
+            late_dom_extracted = await extract_offer_urls(
+                session=session,
+                pw_page=pw_page,
+                model_opts=model_opts,
+                domain=domain,
+                inferred_pattern=None,
+                listing_selector=listing_selector,
+                use_llm_extract=False,
+            )
+            raw_extracted = merge_unique_urls(raw_extracted, late_dom_extracted)
         if not seed_urls and raw_extracted:
             seed_urls = await filter_offer_candidates_with_llm(
                 session=session,
