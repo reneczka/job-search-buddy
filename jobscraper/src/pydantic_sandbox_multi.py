@@ -29,11 +29,14 @@ BULLDOG_POC_URL = (
     "https://bulldogjob.pl/companies/jobs/s/skills,Python/experienceLevel,intern,junior/order,published,desc"
 )
 PRACUJ_POC_URL = "https://it.pracuj.pl/praca?et=1%2C3%2C17&sc=0&itth=37"
+INDEED_HOME_URL = "https://pl.indeed.com"
+INDEED_SEARCH_TERM = "python junior"
 JJ_FIRST_VISIBLE_OFFER_URL = "https://justjoin.it/job-offer/epam-systems-python-engineering-trainee-poland-remote--python"
 NF_FIRST_VISIBLE_OFFER_URL = (
     "https://nofluffjobs.com/pl/job/software-engineer-early-careers-programme-tesco-technology-krakow"
 )
 BD_FIRST_VISIBLE_OFFER_URL = "https://bulldogjob.pl/companies/jobs/230066-project-manager-ai-and-innovation-warsaw-teamquest"
+INDEED_EXPECTED_VISIBLE_OFFERS = 15
 TRUTHY = {"1", "true", "yes"}
 SAFETY_STEP_LIMIT = 250
 
@@ -48,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Universal multi-board Stagehand scraper.")
     parser.add_argument(
         "--site",
-        choices=["all", "justjoin", "theprotocol", "nofluffjobs", "bulldogjob", "pracuj"],
+        choices=["all", "justjoin", "theprotocol", "nofluffjobs", "bulldogjob", "pracuj", "indeed"],
         default="all",
         help="Run one site or all supported sites in a single execution.",
     )
@@ -62,6 +65,7 @@ def selected_targets(site: str) -> list[TargetBoard]:
         TargetBoard(name="nofluffjobs", url=NOFLUFF_POC_URL),
         TargetBoard(name="bulldogjob", url=env_str("STAGEHAND_POC_URL", BULLDOG_POC_URL)),
         TargetBoard(name="pracuj", url=PRACUJ_POC_URL),
+        TargetBoard(name="indeed", url=INDEED_HOME_URL),
     ]
     if site == "all":
         return all_targets
@@ -89,9 +93,19 @@ def is_pracuj_domain(domain: str) -> bool:
     return normalized == "pracuj.pl" or normalized.endswith(".pracuj.pl")
 
 
+def is_indeed_domain(domain: str) -> bool:
+    normalized = normalize_domain(domain)
+    return normalized == "indeed.com" or normalized.endswith(".indeed.com")
+
+
 def normalize_offer_url(url: str) -> str:
     parts = urlsplit(url)
     return urlunsplit((parts.scheme, parts.netloc, parts.path, "", ""))
+
+
+def normalize_indeed_offer_url(url: str) -> str:
+    parts = urlsplit(url)
+    return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
 
 
 def normalize_page_url(url: str) -> str:
@@ -180,6 +194,8 @@ def is_offer_candidate_url(url: str, domain: str) -> bool:
         return bool(re.search(r"\d", tail) and "-" in tail)
     if is_pracuj_domain(domain_norm):
         return path.startswith("/praca/") and ",oferta," in path
+    if is_indeed_domain(domain_norm):
+        return path.rstrip("/") == "/rc/clk" and bool(parse_qs(parsed.query).get("jk"))
     return True
 
 
@@ -930,6 +946,186 @@ async def dismiss_pracuj_popups(pw_page: Page) -> None:
             pass
 
 
+async def search_indeed(
+    session: Any,
+    pw_page: Page,
+    model_name: str,
+    cache_enabled: bool,
+) -> None:
+    await session.execute(
+        execute_options={
+            "instruction": (
+                f'On the Indeed homepage, enter "{INDEED_SEARCH_TERM}" into the job title or keywords search field, '
+                "leave location empty, and submit the search. Stay on the first results page."
+            ),
+            "max_steps": 3,
+        },
+        agent_config={"model": model_name},
+        should_cache=cache_enabled,
+        page=pw_page,
+    )
+    await sleep_ms(1800)
+    if "/jobs" in pw_page.url:
+        return
+
+    inputs = pw_page.get_by_role("combobox")
+    if await inputs.count() >= 1:
+        await inputs.nth(0).fill(INDEED_SEARCH_TERM)
+    if await inputs.count() >= 2:
+        await inputs.nth(1).fill("")
+
+    search_button = pw_page.get_by_role("button", name="Szukaj pracy")
+    if await search_button.count():
+        await search_button.first.click()
+    elif await inputs.count():
+        await inputs.nth(0).press("Enter")
+    await sleep_ms(1800)
+
+
+async def infer_selector_from_first_offer(
+    pw_page: Page,
+    first_url: str,
+) -> Optional[str]:
+    del pw_page
+    try:
+        parsed = urlsplit(first_url)
+    except Exception:
+        return None
+    if not parsed.path:
+        return None
+    query_keys = [key for key in parse_qs(parsed.query).keys() if key]
+    if query_keys:
+        return f'main a[href*="{parsed.path}"][href*="{query_keys[0]}="]'
+    return f'main a[href*="{parsed.path}"]'
+
+
+async def extract_urls_with_selector(
+    pw_page: Page,
+    selector: str,
+    domain: str,
+) -> list[str]:
+    try:
+        raw = await pw_page.evaluate(
+            """(selector) => {
+                const normalize = (value) => {
+                  try {
+                    return new URL(value, window.location.href).toString();
+                  } catch {
+                    return "";
+                  }
+                };
+                const visible = (el) => {
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                return Array.from(document.querySelectorAll(selector))
+                  .filter((el) => visible(el))
+                  .map((el) => normalize(el.getAttribute("href") || el.href || ""))
+                  .filter(Boolean);
+            }""",
+            selector,
+        )
+    except Exception:
+        raw = []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, str):
+            continue
+        normalized = normalize_indeed_offer_url(entry)
+        if not normalized or not is_offer_candidate_url(normalized, domain):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+async def extract_indeed_dom_offer_urls(
+    pw_page: Page,
+    domain: str,
+) -> list[str]:
+    try:
+        raw = await pw_page.evaluate(
+            """() => {
+                const toAbs = (value) => {
+                  try {
+                    return new URL(value, window.location.href).toString();
+                  } catch {
+                    return "";
+                  }
+                };
+                const visible = (el) => {
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                return Array.from(document.querySelectorAll("main a[href]"))
+                  .filter((el) => visible(el))
+                  .map((el) => toAbs(el.getAttribute("href") || el.href || ""))
+                  .filter(Boolean);
+            }"""
+        )
+    except Exception:
+        raw = []
+
+    out: list[str] = []
+    seen: set[str] = set()
+    for entry in raw if isinstance(raw, list) else []:
+        if not isinstance(entry, str):
+            continue
+        normalized = normalize_indeed_offer_url(entry)
+        if not normalized or not is_offer_candidate_url(normalized, domain):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        out.append(normalized)
+    return out
+
+
+async def extract_indeed_visible_offer_urls(
+    session: Any,
+    pw_page: Page,
+    model_opts: dict[str, Any],
+    domain: str,
+) -> tuple[list[str], Optional[OfferPattern], Optional[str]]:
+    raw_candidates = await extract_indeed_dom_offer_urls(pw_page, domain)
+    filtered_candidates = list(raw_candidates)
+
+    first_url = (filtered_candidates or raw_candidates or [""])[0]
+    inferred_pattern = await infer_offer_pattern_with_llm(
+        session=session,
+        pw_page=pw_page,
+        model_opts=model_opts,
+        domain=domain,
+        candidate_urls=filtered_candidates or raw_candidates,
+    )
+    if inferred_pattern is None and first_url:
+        inferred_pattern = infer_offer_pattern_from_url(first_url)
+
+    selector = await infer_selector_from_first_offer(
+        pw_page=pw_page,
+        first_url=inferred_pattern.first_url if inferred_pattern else first_url,
+    )
+
+    selector_urls = await extract_urls_with_selector(pw_page, selector, domain) if selector else []
+
+    merged: list[str] = []
+    seen: set[str] = set()
+    for candidate in selector_urls + filtered_candidates + raw_candidates:
+        normalized = normalize_indeed_offer_url(candidate)
+        if not normalized or not is_offer_candidate_url(normalized, domain):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        merged.append(normalized)
+
+    return merged, inferred_pattern, selector
+
+
 async def collect_pracuj_visible_offer_urls(
     pw_page: Page,
     domain: str,
@@ -1606,6 +1802,44 @@ async def collect_pracuj_offers(
     return all_offers
 
 
+async def collect_indeed_offers(
+    session: Any,
+    pw_page: Page,
+    model_opts: dict[str, Any],
+    model_name: str,
+    domain: str,
+    cache_enabled: bool,
+) -> list[str]:
+    console.print(f"SEARCH_TERM={INDEED_SEARCH_TERM}")
+    await accept_cookies(session, pw_page, model_opts)
+    await search_indeed(session, pw_page, model_name, cache_enabled)
+    await accept_cookies(session, pw_page, model_opts)
+
+    offers: list[str] = []
+    inferred_pattern: Optional[OfferPattern] = None
+    selector: Optional[str] = None
+    for attempt in range(1, 4):
+        offers, inferred_pattern, selector = await extract_indeed_visible_offer_urls(
+            session=session,
+            pw_page=pw_page,
+            model_opts=model_opts,
+            domain=domain,
+        )
+        console.print(f"ATTEMPT={attempt} FOUND_URLS_COUNT={len(offers)} PAGE={pw_page.url}")
+        if len(offers) >= INDEED_EXPECTED_VISIBLE_OFFERS:
+            break
+        await sleep_ms(1200)
+
+    if inferred_pattern:
+        console.print(f"FIRST_GOOD_OFFER_URL={inferred_pattern.first_url}")
+        console.print(f"OFFER_URL_PATTERN_INCLUDE_TOKENS={','.join(inferred_pattern.include_tokens) or '-'}")
+        console.print(f"OFFER_URL_PATTERN_EXCLUDE_TOKENS={','.join(inferred_pattern.exclude_tokens) or '-'}")
+    if selector:
+        console.print(f"JOB_LINK_SELECTOR={selector}")
+
+    return offers
+
+
 async def collect_offers(
     session: Any,
     pw_page: Page,
@@ -1616,6 +1850,15 @@ async def collect_offers(
     target_url: str,
     board_name: str,
 ) -> list[str]:
+    if board_name == "indeed":
+        return await collect_indeed_offers(
+            session=session,
+            pw_page=pw_page,
+            model_opts=model_opts,
+            model_name=model_name,
+            domain=domain,
+            cache_enabled=cache_enabled,
+        )
     if board_name == "pracuj":
         return await collect_pracuj_offers(
             session=session,
