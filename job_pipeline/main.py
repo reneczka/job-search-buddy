@@ -29,15 +29,32 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--write-airtable",
         action="store_true",
-        help="Reserved for a later step. Writes remain disabled in this iteration.",
+        help="Still disabled. Use --write-airtable-indeed-url-test for the narrow Indeed-only write check.",
+    )
+    parser.add_argument(
+        "--write-airtable-indeed-url-test",
+        action="store_true",
+        help="Write only Source + Link for Indeed records to Airtable. Requires --site indeed.",
     )
     return parser.parse_args()
 
 
 async def _run() -> None:
     args = parse_args()
-    dry_run = args.dry_run or not args.write_airtable
-    await run_pipeline(site=args.site, dry_run=dry_run, write_airtable=args.write_airtable)
+    if args.write_airtable:
+        raise RuntimeError(
+            "Broad Airtable sync remains disabled. Use --write-airtable-indeed-url-test with --site indeed."
+        )
+    if args.write_airtable_indeed_url_test and args.site != "indeed":
+        raise RuntimeError("The Indeed Airtable URL-only test requires --site indeed.")
+
+    dry_run = args.dry_run or not args.write_airtable_indeed_url_test
+    await run_pipeline(
+        site=args.site,
+        dry_run=dry_run,
+        write_airtable=args.write_airtable,
+        write_airtable_indeed_url_test=args.write_airtable_indeed_url_test,
+    )
 
 
 def main() -> None:

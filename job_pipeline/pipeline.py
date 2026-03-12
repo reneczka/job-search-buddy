@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 from .airtable_mapper import dedupe_airtable_records, to_airtable_record
-from .airtable_sync import write_airtable_records
+from .airtable_sync import write_airtable_records, write_indeed_url_test_records
 from .boards import selected_boards
 from .detail_extraction import extract_job_detail
 from .models import PipelineRunResult
@@ -24,11 +24,20 @@ from .url_discovery import discover_job_urls
 console = Console()
 
 
-async def run_pipeline(site: str, dry_run: bool, write_airtable: bool) -> PipelineRunResult:
+async def run_pipeline(
+    site: str,
+    dry_run: bool,
+    write_airtable: bool,
+    write_airtable_indeed_url_test: bool = False,
+) -> PipelineRunResult:
     load_dotenv()
     boards = selected_boards(site)
     if not boards:
         raise RuntimeError(f"No boards matched --site {site!r}.")
+    if write_airtable and write_airtable_indeed_url_test:
+        raise RuntimeError("Choose only one Airtable mode.")
+    if write_airtable_indeed_url_test and site != "indeed":
+        raise RuntimeError("The Indeed Airtable URL-only test requires --site indeed.")
 
     runtime = await StagehandRuntime.create()
     discovery_results = []
@@ -36,7 +45,13 @@ async def run_pipeline(site: str, dry_run: bool, write_airtable: bool) -> Pipeli
     board_counts: list[tuple[str, int, int]] = []
 
     try:
-        console.print(f"PIPELINE_MODE={'dry-run' if dry_run or not write_airtable else 'write-airtable'}")
+        if write_airtable_indeed_url_test:
+            pipeline_mode = "indeed-airtable-url-test"
+        elif dry_run or not write_airtable:
+            pipeline_mode = "dry-run"
+        else:
+            pipeline_mode = "write-airtable"
+        console.print(f"PIPELINE_MODE={pipeline_mode}")
         console.print(f"STAGEHAND_CACHE_ENABLED={str(runtime.cache_enabled).lower()}")
         if env_flag("STAGEHAND_CACHE_PROBE", "false"):
             await run_cache_probe(runtime)
@@ -78,6 +93,12 @@ async def run_pipeline(site: str, dry_run: bool, write_airtable: bool) -> Pipeli
 
         if write_airtable:
             write_airtable_records(deduped_records)
+        if write_airtable_indeed_url_test:
+            result = write_indeed_url_test_records(deduped_records)
+            console.print(
+                f"AIRTABLE_INDEED_URL_TEST created={result['created']} "
+                f"skipped={result['skipped']} candidates={len(deduped_records)}"
+            )
 
         metrics = await fetch_stagehand_metrics(
             base_url=str(runtime.client.base_url),

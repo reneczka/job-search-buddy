@@ -292,6 +292,9 @@ class StagehandRuntime:
         model_api_key: Optional[str],
         browserbase_api_key: Optional[str],
         browserbase_project_id: Optional[str],
+        model_base_url: Optional[str],
+        stagehand_server: str,
+        local_headless: bool,
         model_opts: dict[str, Any],
         cache_enabled: bool,
     ) -> None:
@@ -306,17 +309,23 @@ class StagehandRuntime:
         self.model_api_key = model_api_key
         self.browserbase_api_key = browserbase_api_key
         self.browserbase_project_id = browserbase_project_id
+        self.model_base_url = model_base_url
+        self.stagehand_server = stagehand_server
+        self.local_headless = local_headless
         self.model_opts = model_opts
         self.cache_enabled = cache_enabled
 
     async def ensure_page(self, force_new: bool = False) -> Page:
+        if await self._browser_stack_closed():
+            await self.restart_browser_session(reason="browser_stack_closed")
+
         if not force_new:
             try:
                 if not self.page.is_closed():
                     return self.page
             except Exception:
                 pass
-            for candidate in self.context.pages:
+            for candidate in await self._context_pages():
                 try:
                     if not candidate.is_closed():
                         self.page = candidate
@@ -324,8 +333,96 @@ class StagehandRuntime:
                 except Exception:
                     continue
 
-        self.page = await self.context.new_page()
+        try:
+            self.page = await self.context.new_page()
+        except Exception:
+            await self.restart_browser_session(reason="context_new_page_failed")
+            self.page = await self.context.new_page()
         return self.page
+
+    async def restart_browser_session(self, reason: str) -> None:
+        console.print(f"RUNTIME_RECOVERY=restart_browser_session reason={reason}")
+        self.session.print_summary()
+        await self._close_current_stack(end_session=True)
+        cleanup_browser_processes()
+        stack = await self._start_runtime_stack(
+            model_name=self.model_name,
+            model_api_key=self.model_api_key,
+            model_base_url=self.model_base_url,
+            cache_enabled=self.cache_enabled,
+            stagehand_server=self.stagehand_server,
+            local_headless=self.local_headless,
+            browserbase_api_key=self.browserbase_api_key,
+            browserbase_project_id=self.browserbase_project_id,
+        )
+        self.client = stack["client"]
+        self.raw_session = stack["raw_session"]
+        self.session = stack["session"]
+        self.playwright = stack["playwright"]
+        self.browser = stack["browser"]
+        self.context = stack["context"]
+        self.page = stack["page"]
+
+    async def _context_pages(self) -> list[Page]:
+        try:
+            return list(self.context.pages)
+        except Exception:
+            return []
+
+    async def _browser_stack_closed(self) -> bool:
+        try:
+            if self.page is not None and not self.page.is_closed():
+                return False
+        except Exception:
+            pass
+        try:
+            pages = self.context.pages
+        except Exception:
+            return True
+        for candidate in pages:
+            try:
+                if not candidate.is_closed():
+                    self.page = candidate
+                    return False
+            except Exception:
+                continue
+        return True
+
+    @staticmethod
+    async def _close_stack_resources(
+        *,
+        session: LoggedStagehandSession,
+        browser: Browser,
+        playwright: Playwright,
+        client: Any,
+        end_session: bool,
+    ) -> None:
+        if end_session:
+            try:
+                await session.end()
+            except Exception:
+                pass
+        try:
+            await browser.close()
+        except Exception:
+            pass
+        try:
+            await playwright.stop()
+        except Exception:
+            pass
+        try:
+            await client.close()
+        except Exception:
+            pass
+
+    async def _close_current_stack(self, end_session: bool) -> None:
+        await self.__class__._close_stack_resources(
+            session=self.session,
+            browser=self.browser,
+            playwright=self.playwright,
+            client=self.client,
+            end_session=end_session,
+        )
 
     @classmethod
     async def create(cls) -> "StagehandRuntime":
@@ -340,6 +437,55 @@ class StagehandRuntime:
         cache_enabled = env_flag("STAGEHAND_EXECUTE_CACHE", "true")
         stagehand_env = env_str("STAGEHAND_ENV", "LOCAL").lower()
         stagehand_server = "remote" if stagehand_env == "remote" else "local"
+        local_headless = env_flag("STAGEHAND_HEADLESS", "false")
+
+        browserbase_api_key = env_str("BROWSERBASE_API_KEY") or None
+        browserbase_project_id = env_str("BROWSERBASE_PROJECT_ID") or None
+
+        stack = await cls._start_runtime_stack(
+            model_name=model_name,
+            model_api_key=model_api_key,
+            model_base_url=model_base_url,
+            cache_enabled=cache_enabled,
+            stagehand_server=stagehand_server,
+            local_headless=local_headless,
+            browserbase_api_key=browserbase_api_key,
+            browserbase_project_id=browserbase_project_id,
+        )
+
+        return cls(
+            client=stack["client"],
+            raw_session=stack["raw_session"],
+            session=stack["session"],
+            playwright=stack["playwright"],
+            browser=stack["browser"],
+            context=stack["context"],
+            page=stack["page"],
+            model_name=model_name,
+            model_api_key=model_api_key,
+            browserbase_api_key=browserbase_api_key,
+            browserbase_project_id=browserbase_project_id,
+            model_base_url=model_base_url,
+            stagehand_server=stagehand_server,
+            local_headless=local_headless,
+            model_opts=model_options(model_name, model_api_key, model_base_url),
+            cache_enabled=cache_enabled,
+        )
+
+    @classmethod
+    async def _start_runtime_stack(
+        cls,
+        *,
+        model_name: str,
+        model_api_key: Optional[str],
+        model_base_url: Optional[str],
+        cache_enabled: bool,
+        stagehand_server: str,
+        local_headless: bool,
+        browserbase_api_key: Optional[str],
+        browserbase_project_id: Optional[str],
+    ) -> dict[str, Any]:
+        del cache_enabled
 
         try:
             from stagehand import AsyncStagehand  # type: ignore
@@ -347,14 +493,10 @@ class StagehandRuntime:
             raise RuntimeError("Stagehand is not installed. Run poetry install.") from exc
 
         configure_local_stagehand_server_logging()
-        cleanup_browser_processes()
-
-        browserbase_api_key = env_str("BROWSERBASE_API_KEY") or None
-        browserbase_project_id = env_str("BROWSERBASE_PROJECT_ID") or None
 
         client_kwargs: dict[str, Any] = {"server": stagehand_server, "model_api_key": model_api_key}
         if stagehand_server == "local":
-            client_kwargs["local_headless"] = env_flag("STAGEHAND_HEADLESS", "false")
+            client_kwargs["local_headless"] = local_headless
             if model_api_key:
                 client_kwargs["local_openai_api_key"] = model_api_key
         if browserbase_api_key:
@@ -369,7 +511,7 @@ class StagehandRuntime:
             verbose=1 if debug_enabled() else 0,
             browser={
                 "type": "local" if stagehand_server == "local" else "browserbase",
-                "launchOptions": {"headless": env_flag("STAGEHAND_HEADLESS", "false")},
+                "launchOptions": {"headless": local_headless},
             },
         )
         if not raw_session.data.cdp_url:
@@ -381,40 +523,20 @@ class StagehandRuntime:
         browser = await playwright.chromium.connect_over_cdp(raw_session.data.cdp_url)
         context: BrowserContext = browser.contexts[0] if browser.contexts else await browser.new_context()
         page: Page = context.pages[0] if context.pages else await context.new_page()
-        opts = model_options(model_name, model_api_key, model_base_url)
-
-        return cls(
-            client=client,
-            raw_session=raw_session,
-            session=session,
-            playwright=playwright,
-            browser=browser,
-            context=context,
-            page=page,
-            model_name=model_name,
-            model_api_key=model_api_key,
-            browserbase_api_key=browserbase_api_key,
-            browserbase_project_id=browserbase_project_id,
-            model_opts=opts,
-            cache_enabled=cache_enabled,
-        )
+        return {
+            "client": client,
+            "raw_session": raw_session,
+            "session": session,
+            "playwright": playwright,
+            "browser": browser,
+            "context": context,
+            "page": page,
+        }
 
     async def close(self) -> None:
         self.session.print_summary()
         try:
-            await self.session.end()
-        except Exception:
-            pass
-        try:
-            await self.browser.close()
-        except Exception:
-            pass
-        try:
-            await self.playwright.stop()
-        except Exception:
-            pass
-        try:
-            await self.client.close()
+            await self._close_current_stack(end_session=True)
         finally:
             cleanup_browser_processes()
 
