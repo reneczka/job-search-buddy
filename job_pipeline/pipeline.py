@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 from rich.console import Console
 
 from .airtable_mapper import dedupe_airtable_records, to_airtable_record
-from .airtable_sync import write_airtable_records, write_indeed_url_test_records
+from .airtable_sync import write_airtable_records, write_indeed_full_records, write_indeed_url_test_records
 from .boards import selected_boards
 from .detail_extraction import extract_job_detail
 from .models import PipelineRunResult
@@ -29,24 +29,31 @@ async def run_pipeline(
     dry_run: bool,
     write_airtable: bool,
     write_airtable_indeed_url_test: bool = False,
+    write_airtable_indeed_full: bool = False,
+    max_jobs_per_board: int | None = None,
 ) -> PipelineRunResult:
     load_dotenv()
     boards = selected_boards(site)
     if not boards:
         raise RuntimeError(f"No boards matched --site {site!r}.")
-    if write_airtable and write_airtable_indeed_url_test:
+    if sum(bool(value) for value in (write_airtable, write_airtable_indeed_url_test, write_airtable_indeed_full)) > 1:
         raise RuntimeError("Choose only one Airtable mode.")
-    if write_airtable_indeed_url_test and site != "indeed":
-        raise RuntimeError("The Indeed Airtable URL-only test requires --site indeed.")
+    if (write_airtable_indeed_url_test or write_airtable_indeed_full) and site != "indeed":
+        raise RuntimeError("The Indeed Airtable write modes require --site indeed.")
 
     runtime = await StagehandRuntime.create()
     discovery_results = []
     mapped_records: list[dict[str, str]] = []
     board_counts: list[tuple[str, int, int]] = []
+    airtable_created = 0
+    airtable_updated = 0
+    airtable_skipped = 0
 
     try:
         if write_airtable_indeed_url_test:
             pipeline_mode = "indeed-airtable-url-test"
+        elif write_airtable_indeed_full:
+            pipeline_mode = "indeed-airtable-full-write"
         elif dry_run or not write_airtable:
             pipeline_mode = "dry-run"
         else:
@@ -62,6 +69,7 @@ async def run_pipeline(
             discovery = await discover_job_urls(runtime, board)
             discovery_results.append(discovery)
             board_record_start = len(mapped_records)
+            board_records: list[dict[str, str]] = []
 
             console.print(
                 f"DISCOVERY_RESULT site={board.name} urls={len(discovery.urls)} "
@@ -69,16 +77,37 @@ async def run_pipeline(
                 f"first_offer={discovery.metadata.first_offer_url or '-'}"
             )
 
-            for index, url in enumerate(discovery.urls, start=1):
-                console.print(f"DETAIL_PROGRESS site={board.name} index={index}/{len(discovery.urls)} url={url}")
+            selected_urls = discovery.urls[:max_jobs_per_board] if max_jobs_per_board else discovery.urls
+            if max_jobs_per_board is not None:
+                console.print(
+                    f"DETAIL_LIMIT site={board.name} selected={len(selected_urls)} "
+                    f"discovered={len(discovery.urls)} max_jobs_per_board={max_jobs_per_board}"
+                )
+
+            for index, url in enumerate(selected_urls, start=1):
+                console.print(f"DETAIL_PROGRESS site={board.name} index={index}/{len(selected_urls)} url={url}")
                 detail = await extract_job_detail(runtime, board.name, url)
-                mapped_records.append(to_airtable_record(detail))
+                record = to_airtable_record(detail)
+                mapped_records.append(record)
+                board_records.append(record)
 
             extracted_count = len(mapped_records) - board_record_start
             board_counts.append((board.name, len(discovery.urls), extracted_count))
             console.print(
                 f"BOARD_RESULT site={board.name} discovered={len(discovery.urls)} extracted={extracted_count}"
             )
+
+            if write_airtable:
+                board_deduped_records = dedupe_airtable_records(board_records)
+                result = write_airtable_records(board_deduped_records)
+                airtable_created += int(result["created"])
+                airtable_updated += int(result["updated"])
+                airtable_skipped += int(result["skipped"])
+                console.print(
+                    f"AIRTABLE_WRITE_BOARD site={board.name} created={result['created']} "
+                    f"updated={result['updated']} skipped={result['skipped']} "
+                    f"candidates={len(board_deduped_records)}"
+                )
 
         deduped_records = dedupe_airtable_records(mapped_records)
         console.print(f"RECORDS_TOTAL={len(mapped_records)}")
@@ -92,12 +121,23 @@ async def run_pipeline(
             console.print(json.dumps(record, ensure_ascii=False, indent=2))
 
         if write_airtable:
-            write_airtable_records(deduped_records)
+            console.print(
+                f"AIRTABLE_WRITE created={airtable_created} "
+                f"updated={airtable_updated} skipped={airtable_skipped} "
+                f"candidates={len(deduped_records)}"
+            )
         if write_airtable_indeed_url_test:
             result = write_indeed_url_test_records(deduped_records)
             console.print(
                 f"AIRTABLE_INDEED_URL_TEST created={result['created']} "
                 f"skipped={result['skipped']} candidates={len(deduped_records)}"
+            )
+        if write_airtable_indeed_full:
+            result = write_indeed_full_records(deduped_records)
+            console.print(
+                f"AIRTABLE_INDEED_FULL_WRITE created={result['created']} "
+                f"updated={result['updated']} skipped={result['skipped']} "
+                f"candidates={len(deduped_records)}"
             )
 
         metrics = await fetch_stagehand_metrics(

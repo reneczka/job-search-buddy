@@ -29,31 +29,44 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--write-airtable",
         action="store_true",
-        help="Still disabled. Use --write-airtable-indeed-url-test for the narrow Indeed-only write check.",
+        help="Write the full Airtable payload for the selected site or all sites. No delete behavior.",
     )
     parser.add_argument(
         "--write-airtable-indeed-url-test",
         action="store_true",
         help="Write only Source + Link for Indeed records to Airtable. Requires --site indeed.",
     )
+    parser.add_argument(
+        "--write-airtable-indeed-full",
+        action="store_true",
+        help="Write the full Airtable payload for Indeed records only. Requires --site indeed.",
+    )
+    parser.add_argument(
+        "--max-jobs-per-board",
+        type=int,
+        default=None,
+        help="Limit extraction and Airtable writes to the first N discovered jobs per board.",
+    )
     return parser.parse_args()
 
 
 async def _run() -> None:
     args = parse_args()
-    if args.write_airtable:
-        raise RuntimeError(
-            "Broad Airtable sync remains disabled. Use --write-airtable-indeed-url-test with --site indeed."
-        )
-    if args.write_airtable_indeed_url_test and args.site != "indeed":
-        raise RuntimeError("The Indeed Airtable URL-only test requires --site indeed.")
+    if (args.write_airtable_indeed_url_test or args.write_airtable_indeed_full) and args.site != "indeed":
+        raise RuntimeError("The Indeed Airtable write modes require --site indeed.")
+    if args.max_jobs_per_board is not None and args.max_jobs_per_board < 1:
+        raise RuntimeError("--max-jobs-per-board must be at least 1.")
 
-    dry_run = args.dry_run or not args.write_airtable_indeed_url_test
+    dry_run = args.dry_run or not (
+        args.write_airtable or args.write_airtable_indeed_url_test or args.write_airtable_indeed_full
+    )
     await run_pipeline(
         site=args.site,
         dry_run=dry_run,
         write_airtable=args.write_airtable,
         write_airtable_indeed_url_test=args.write_airtable_indeed_url_test,
+        write_airtable_indeed_full=args.write_airtable_indeed_full,
+        max_jobs_per_board=args.max_jobs_per_board,
     )
 
 
