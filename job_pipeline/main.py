@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+from time import perf_counter
 
 from rich.console import Console
 from rich.panel import Panel
@@ -11,6 +12,17 @@ from .pipeline import run_pipeline
 
 
 console = Console()
+
+
+def _format_duration(seconds: float) -> str:
+    total_seconds = max(int(round(seconds)), 0)
+    minutes, secs = divmod(total_seconds, 60)
+    hours, mins = divmod(minutes, 60)
+    if hours:
+        return f"{hours}h {mins}m {secs}s"
+    if minutes:
+        return f"{minutes}m {secs}s"
+    return f"{secs}s"
 
 
 def parse_args() -> argparse.Namespace:
@@ -71,13 +83,22 @@ async def _run() -> None:
 
 
 def main() -> None:
+    started = perf_counter()
+    run_status = "ok"
     try:
         asyncio.run(_run())
     except KeyboardInterrupt:
+        run_status = "interrupted"
         console.print("Interrupted by user.")
     except Exception as exc:
+        run_status = "failed"
         console.print(Panel(str(exc), title="Pipeline Error", style="red"))
         raise
+    finally:
+        duration = perf_counter() - started
+        console.print(f"RUN_STATUS={run_status}")
+        console.print(f"RUN_DURATION_SECONDS={duration:.2f}")
+        console.print(f"RUN_DURATION_HUMAN={_format_duration(duration)}")
 
 
 if __name__ == "__main__":

@@ -1,11 +1,12 @@
 from __future__ import annotations
 
 import json
+from time import perf_counter
 
 from dotenv import load_dotenv
 from rich.console import Console
 
-from .airtable_mapper import dedupe_airtable_records, to_airtable_record
+from .airtable_mapper import dedupe_airtable_records, to_airtable_record, validate_airtable_record
 from .airtable_sync import write_airtable_records, write_indeed_full_records, write_indeed_url_test_records
 from .boards import selected_boards
 from .detail_extraction import extract_job_detail
@@ -48,6 +49,7 @@ async def run_pipeline(
     airtable_created = 0
     airtable_updated = 0
     airtable_skipped = 0
+    invalid_records_skipped = 0
 
     try:
         if write_airtable_indeed_url_test:
@@ -66,10 +68,12 @@ async def run_pipeline(
             console.print("CACHE_PROBE=disabled")
 
         for board in boards:
+            board_started = perf_counter()
             discovery = await discover_job_urls(runtime, board)
             discovery_results.append(discovery)
             board_record_start = len(mapped_records)
             board_records: list[dict[str, str]] = []
+            board_invalid_records = 0
 
             console.print(
                 f"DISCOVERY_RESULT site={board.name} urls={len(discovery.urls)} "
@@ -88,6 +92,15 @@ async def run_pipeline(
                 console.print(f"DETAIL_PROGRESS site={board.name} index={index}/{len(selected_urls)} url={url}")
                 detail = await extract_job_detail(runtime, board.name, url)
                 record = to_airtable_record(detail)
+                issues = validate_airtable_record(record)
+                if issues:
+                    board_invalid_records += 1
+                    invalid_records_skipped += 1
+                    console.print(
+                        f"INVALID_RECORD site={board.name} url={record.get('Link', url)} "
+                        f"reasons={' | '.join(issues)}"
+                    )
+                    continue
                 mapped_records.append(record)
                 board_records.append(record)
 
@@ -96,9 +109,17 @@ async def run_pipeline(
             console.print(
                 f"BOARD_RESULT site={board.name} discovered={len(discovery.urls)} extracted={extracted_count}"
             )
+            if board_invalid_records:
+                console.print(f"BOARD_INVALID_SKIPPED site={board.name} count={board_invalid_records}")
+            console.print(f"BOARD_RUNTIME site={board.name} seconds={perf_counter() - board_started:.2f}")
 
             if write_airtable:
                 board_deduped_records = dedupe_airtable_records(board_records)
+                if not board_deduped_records:
+                    console.print(
+                        f"AIRTABLE_WRITE_BOARD site={board.name} created=0 updated=0 skipped=0 candidates=0"
+                    )
+                    continue
                 result = write_airtable_records(board_deduped_records)
                 airtable_created += int(result["created"])
                 airtable_updated += int(result["updated"])
@@ -112,6 +133,7 @@ async def run_pipeline(
         deduped_records = dedupe_airtable_records(mapped_records)
         console.print(f"RECORDS_TOTAL={len(mapped_records)}")
         console.print(f"RECORDS_DEDUPED={len(deduped_records)}")
+        console.print(f"RECORDS_INVALID_SKIPPED={invalid_records_skipped}")
         for site_name, discovered_count, extracted_count in board_counts:
             console.print(
                 f"BOARD_SUMMARY site={site_name} discovered={discovered_count} extracted={extracted_count}"

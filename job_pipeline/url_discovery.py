@@ -138,7 +138,11 @@ def infer_offer_pattern_from_url(first_url: str) -> Optional[OfferPattern]:
         is_slug_like = len(second) >= 18 and ("-" in second or re.search(r"\d", second) is not None)
         if not is_slug_like:
             include_tokens.append(second)
-    return OfferPattern(first_url=first_url, include_tokens=include_tokens, exclude_tokens=[])
+    return OfferPattern(
+        first_url=first_url,
+        include_tokens=_sanitize_pattern_tokens(include_tokens),
+        exclude_tokens=[],
+    )
 
 
 def infer_offer_pattern_from_candidates(candidates: list[str]) -> Optional[OfferPattern]:
@@ -155,7 +159,11 @@ def infer_offer_pattern_from_candidates(candidates: list[str]) -> Optional[Offer
         return None
     dominant = max(counts, key=counts.get)
     sample_url = grouped[dominant][0]
-    return OfferPattern(first_url=sample_url, include_tokens=[dominant[0], dominant[1]], exclude_tokens=[])
+    return OfferPattern(
+        first_url=sample_url,
+        include_tokens=_sanitize_pattern_tokens([dominant[0], dominant[1]]),
+        exclude_tokens=[],
+    )
 
 
 def matches_offer_pattern(url: str, pattern: Optional[OfferPattern]) -> bool:
@@ -172,6 +180,22 @@ def matches_offer_pattern(url: str, pattern: Optional[OfferPattern]) -> bool:
     if pattern.exclude_tokens and any(has_token(token) for token in pattern.exclude_tokens):
         return False
     return True
+
+
+def _sanitize_pattern_tokens(tokens: list[str]) -> list[str]:
+    cleaned: list[str] = []
+    seen: set[str] = set()
+    for token in tokens:
+        normalized = str(token or "").strip().lower()
+        if not normalized:
+            continue
+        if not re.search(r"[a-z0-9]", normalized):
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        cleaned.append(normalized)
+    return cleaned
 
 
 def is_offer_candidate_url(url: str, domain: str) -> bool:
@@ -313,6 +337,8 @@ async def infer_offer_pattern_with_llm(
             for token in (payload.get("exclude_path_tokens") or [])
             if isinstance(token, str) and str(token).strip()
         ]
+        include = _sanitize_pattern_tokens(include)
+        exclude = _sanitize_pattern_tokens(exclude)
         if not include:
             return infer_offer_pattern_from_url(first_url)
         return OfferPattern(first_url=first_url, include_tokens=include[:4], exclude_tokens=exclude[:8])
@@ -555,7 +581,14 @@ async def accept_cookies(runtime: StagehandRuntime, page: Page) -> bool:
 
 
 async def dismiss_pracuj_popups(page: Page) -> None:
-    for label in ("Zamknij", "Akceptuj wszystkie"):
+    for label in (
+        "Zamknij",
+        "Akceptuj wszystkie",
+        "Akceptuj",
+        "Zgadzam się",
+        "Przejdź do serwisu",
+        "Rozumiem",
+    ):
         try:
             button = page.get_by_role("button", name=label)
             if await button.count():
@@ -563,6 +596,36 @@ async def dismiss_pracuj_popups(page: Page) -> None:
                 await sleep_ms(400)
         except Exception:
             pass
+    try:
+        clicked = await page.evaluate(
+            """() => {
+                const labels = [
+                  "zamknij",
+                  "akceptuj wszystkie",
+                  "akceptuj",
+                  "zgadzam się",
+                  "przejdź do serwisu",
+                  "rozumiem",
+                  "accept all",
+                  "accept",
+                  "agree",
+                ];
+                const nodes = Array.from(document.querySelectorAll("button, [role='button'], a"));
+                for (const el of nodes) {
+                  const text = (el.textContent || "").trim().toLowerCase().replace(/\\s+/g, " ");
+                  if (!text || !labels.some((label) => text.includes(label))) continue;
+                  const disabled = el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true";
+                  if (disabled) continue;
+                  el.click();
+                  return true;
+                }
+                return false;
+            }"""
+        )
+        if clicked:
+            await sleep_ms(600)
+    except Exception:
+        pass
 
 
 async def search_indeed(runtime: StagehandRuntime, page: Page) -> None:
@@ -1126,9 +1189,9 @@ async def extract_offer_urls(
                   if (!t) continue;
                   const matches = t.match(/https?:\\/\\/[^"'\\s<>]+|\\/[a-zA-Z0-9_\\-\\/.,%]+/g) || [];
                   for (const m of matches) pushUrl(m);
-                  const escapedMatches = t.match(/\\\\\\/pl\\\\\\/job\\\\\\/[a-zA-Z0-9\\-]+/g) || [];
+                  const escapedMatches = t.match(/https?:\\\\\\/\\\\\\/[^"'\\s<>]+|\\\\\\/[a-zA-Z0-9_\\-\\\\\\/.,%]+/g) || [];
                   for (const m of escapedMatches) {
-                    pushUrl(m.replace(/\\\\\\//g, "/"));
+                    pushUrl(m.replace(/\\\\\\//g, "/").replace(/\\u002F/g, "/"));
                   }
                 }
                 return out.slice(0, 5000);
@@ -1298,9 +1361,9 @@ async def reveal_more(runtime: StagehandRuntime, page: Page) -> bool:
 
 
 async def collect_pracuj_offers(runtime: StagehandRuntime, board: BoardConfig, page: Page) -> DiscoveryResult:
-    await accept_cookies(runtime, page)
     await dismiss_pracuj_popups(page)
     await accept_cookies(runtime, page)
+    await dismiss_pracuj_popups(page)
 
     offers: list[str] = []
     inferred_pattern: Optional[OfferPattern] = None
@@ -1317,6 +1380,7 @@ async def collect_pracuj_offers(runtime: StagehandRuntime, board: BoardConfig, p
         )
         if offers:
             break
+        await dismiss_pracuj_popups(page)
         await sleep_ms(1200)
 
     all_offers: list[str] = []
