@@ -23,7 +23,6 @@ from .stagehand_session import (
 console: Console = shared_console
 
 INDEED_SEARCH_TERM = "python junior"
-INDEED_EXPECTED_VISIBLE_OFFERS = 15
 SAFETY_STEP_LIMIT = 250
 JJ_FIRST_VISIBLE_OFFER_URL = "https://justjoin.it/job-offer/epam-systems-python-engineering-trainee-poland-remote--python"
 NF_FIRST_VISIBLE_OFFER_URL = (
@@ -99,6 +98,10 @@ def normalize_offer_url(url: str) -> str:
 
 def normalize_indeed_offer_url(url: str) -> str:
     parts = urlsplit(url)
+    query = parse_qs(parts.query)
+    job_keys = query.get("jk") or query.get("vjk") or []
+    if parts.path.rstrip("/") in {"/rc/clk", "/viewjob"} and job_keys and job_keys[0]:
+        return urlunsplit((parts.scheme, parts.netloc, "/viewjob", f"jk={job_keys[0]}", ""))
     return urlunsplit((parts.scheme, parts.netloc, parts.path, parts.query, ""))
 
 
@@ -232,7 +235,12 @@ def is_offer_candidate_url(url: str, domain: str) -> bool:
     if is_pracuj_domain(domain_norm):
         return path.startswith("/praca/") and ",oferta," in path
     if is_indeed_domain(domain_norm):
-        return path.rstrip("/") == "/rc/clk" and bool(parse_qs(parsed.query).get("jk"))
+        query = parse_qs(parsed.query)
+        if path.rstrip("/") == "/rc/clk":
+            return bool(query.get("jk"))
+        if path.rstrip("/") == "/viewjob":
+            return bool(query.get("jk") or query.get("vjk"))
+        return False
     return True
 
 
@@ -666,6 +674,8 @@ async def infer_selector_from_first_offer(first_url: str) -> Optional[str]:
         return None
     if not parsed.path:
         return None
+    if parsed.path.rstrip("/") == "/viewjob" and parse_qs(parsed.query).get("jk"):
+        return 'main a[data-jk][href], [data-testid="slider_item"] a[href]'
     query_keys = [key for key in parse_qs(parsed.query).keys() if key]
     if query_keys:
         return f'main a[href*="{parsed.path}"][href*="{query_keys[0]}="]'
@@ -723,14 +733,21 @@ async def extract_indeed_dom_offer_urls(page: Page, domain: str) -> list[str]:
                     return "";
                   }
                 };
-                const visible = (el) => {
-                  const rect = el.getBoundingClientRect();
-                  return rect.width > 0 && rect.height > 0;
+                const push = (items, value) => {
+                  const normalized = toAbs(value);
+                  if (normalized) items.push(normalized);
                 };
-                return Array.from(document.querySelectorAll("main a[href]"))
-                  .filter((el) => visible(el))
-                  .map((el) => toAbs(el.getAttribute("href") || el.href || ""))
-                  .filter(Boolean);
+                const items = [];
+                const seenJk = new Set();
+                for (const el of Array.from(document.querySelectorAll('a[data-jk], [data-testid="slider_item"] a[href], main a[href]'))) {
+                  const jobKey = (el.getAttribute("data-jk") || "").trim();
+                  if (jobKey && !seenJk.has(jobKey)) {
+                    seenJk.add(jobKey);
+                    push(items, `/viewjob?jk=${encodeURIComponent(jobKey)}`);
+                  }
+                  push(items, el.getAttribute("href") || el.href || "");
+                }
+                return items;
             }"""
         )
     except Exception:
@@ -749,6 +766,15 @@ async def extract_indeed_dom_offer_urls(page: Page, domain: str) -> list[str]:
         seen.add(normalized)
         out.append(normalized)
     return out
+
+
+async def wait_for_indeed_results(page: Page, domain: str, timeout_ms: int = 9000) -> None:
+    deadline = time.perf_counter() + (timeout_ms / 1000)
+    while time.perf_counter() < deadline:
+        offers = await extract_indeed_dom_offer_urls(page, domain)
+        if offers:
+            return
+        await sleep_ms(600)
 
 
 async def extract_indeed_visible_offer_urls(
@@ -1429,26 +1455,30 @@ async def collect_indeed_offers(runtime: StagehandRuntime, board: BoardConfig, p
     await accept_cookies(runtime, page)
     await search_indeed(runtime, page)
     await accept_cookies(runtime, page)
+    await wait_for_indeed_results(page, domain)
 
     offers: list[str] = []
     inferred_pattern: Optional[OfferPattern] = None
     selector: Optional[str] = None
+    previous_count = -1
     for attempt in range(1, 4):
         offers, inferred_pattern, selector = await extract_indeed_visible_offer_urls(runtime, page, domain)
         console.print(f"ATTEMPT={attempt} FOUND_URLS_COUNT={len(offers)} PAGE={page.url}")
-        if len(offers) >= INDEED_EXPECTED_VISIBLE_OFFERS:
+        if offers and (len(offers) == previous_count or attempt >= 2):
             break
+        previous_count = len(offers)
         await sleep_ms(1200)
 
     log_offer_pattern(inferred_pattern)
     log_job_link_selector(selector)
+    expected_count = await read_results_header_count(page)
 
     metadata = DiscoveryMetadata(
         first_offer_url=inferred_pattern.first_url if inferred_pattern else "",
         selector=selector or "",
         include_tokens=list(inferred_pattern.include_tokens) if inferred_pattern else [],
         exclude_tokens=list(inferred_pattern.exclude_tokens) if inferred_pattern else [],
-        expected_count=INDEED_EXPECTED_VISIBLE_OFFERS,
+        expected_count=expected_count or len(offers),
         total_steps=1,
     )
     return DiscoveryResult(board=board, urls=offers, metadata=metadata)

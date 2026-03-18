@@ -107,6 +107,7 @@ def _clean_listing_summary(value: str) -> str:
     cleaned = _strip_leading_city_prefix(cleaned)
     cleaned = _strip_formulaic_offer_lead(cleaned)
     cleaned = _strip_leading_cta_questions(cleaned)
+    cleaned = _strip_leading_job_meta(cleaned)
     cleaned = _strip_trailing_listing_location(cleaned)
     cleaned = _strip_labeled_prefix_blocks(cleaned)
     cleaned = _strip_leading_section_labels(
@@ -195,6 +196,8 @@ def _clean_listing_summary(value: str) -> str:
     ):
         return "N/A"
     if _looks_like_compact_meta_blurb(cleaned):
+        return "N/A"
+    if _looks_like_work_condition_blurb(cleaned):
         return "N/A"
     if _contains_job_meta_chrome(cleaned):
         return "N/A"
@@ -308,6 +311,7 @@ def _clean_company_description(value: str) -> str:
     cleaned = _strip_leading_cta_questions(cleaned)
     cleaned = _normalize_leading_description_fragment(cleaned)
     cleaned = _drop_leading_metadata_segments(cleaned)
+    cleaned = _strip_leading_job_meta(cleaned)
     if _clean_listing_summary(cleaned) == "N/A":
         return "N/A"
     cleaned = _strip_labeled_prefix_blocks(cleaned)
@@ -344,11 +348,15 @@ def _clean_company_description(value: str) -> str:
         return "N/A"
     if _contains_job_meta_chrome(cleaned):
         return "N/A"
+    if _looks_like_work_condition_blurb(cleaned):
+        return "N/A"
 
     cleaned = re.sub(r"^(job description|what you will do|co będziesz robić|why should you join us\?)\s*[:\-]?\s*", "", cleaned, flags=re.I)
     cleaned = _trim_after_markers(
         cleaned,
         (
+            "location:",
+            "lokalizacja:",
             "the work:",
             "the work",
             "jak możesz nam pomóc",
@@ -378,11 +386,18 @@ def _clean_company_description(value: str) -> str:
             "co możemy ci zaoferować",
             "benefits",
             "our culture",
+            "work with the following technologies:",
+            "w naszej ofercie znajdują się",
             "jak wygląda proces rekrutacji",
             "czekamy na twoją aplikację",
             "parleto tworzą ludzie",
         ),
     )
+    cleaned = re.sub(r"\bIn this role, you will:\s*.*$", "", cleaned, flags=re.I)
+    cleaned = re.sub(r"\bAs an? [^.!?]{0,80}, you will:\s*.*$", "", cleaned, flags=re.I)
+    cleaned = _trim_after_role_transition(cleaned)
+    if _looks_like_task_heavy_description(cleaned):
+        cleaned = _first_sentence(cleaned)
     cleaned = cleaned.strip(" -:")
     cleaned = _trim_incomplete_trailing_fragment(cleaned)
     if len(cleaned) < 24:
@@ -400,9 +415,35 @@ def _clean_company_description(value: str) -> str:
 
 
 def _clean_location(value: str) -> str:
-    cleaned = _normalize_missing(value)
+    cleaned = _normalize_free_text(value)
     if cleaned == "N/A":
         return cleaned
+
+    cleaned = re.sub(r"^\s*(?:miejsce pracy|location|lokalizacja)\s*:\s*", "", cleaned, flags=re.I)
+    cleaned = _trim_after_markers(
+        cleaned,
+        (
+            " start:",
+            " współpraca:",
+            " wynagrodzenie:",
+            " proces rekrutacyjny:",
+            " tryb pracy:",
+            " rodzaj umowy:",
+            " wymiar pracy:",
+            " system wynagrodzeń:",
+            " model pracy:",
+            " employment:",
+            " contract:",
+        ),
+    ).strip(" -:,")
+    cleaned = re.sub(
+        r"\b(?:młodszy specjalista / młodsza specjalistka \(junior\)|junior specialist \(junior\)|assistant, junior specialist|specjalista / specjalistka \(mid / regular\)|specialist \(mid / regular\))\b.*$",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip(" -:,")
+    if not cleaned:
+        return "N/A"
 
     parts = [part.strip() for part in cleaned.split(",") if part.strip()]
     deduped_parts: list[str] = []
@@ -425,6 +466,9 @@ def _clean_salary(value: str) -> str:
 
     cleaned = unescape(cleaned).replace("\xa0", " ").replace("\n", " ")
     cleaned = cleaned.replace("zł", "PLN")
+    cleaned = re.sub(r"\bPLN(?:otych|\.?)\b", "PLN", cleaned, flags=re.I)
+    cleaned = cleaned.replace("–", "-").replace("—", "-")
+    cleaned = re.sub(r"\b\d\s(?=\d{1,2}\s\d{3}\b)", "", cleaned)
     cleaned = re.sub(r"(?<=\d)(PLN|EUR|USD)\b", r" \1", cleaned)
     cleaned = re.sub(r"\bza miesiąc\b", "/ month", cleaned, flags=re.I)
     cleaned = re.sub(r"\bza godzinę\b", "/ hour", cleaned, flags=re.I)
@@ -434,10 +478,12 @@ def _clean_salary(value: str) -> str:
     cleaned = re.sub(r"\b(miesiąc|mies\.)\b", "month", cleaned, flags=re.I)
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     cleaned = re.sub(r"\s*/\s*", " / ", cleaned)
+    cleaned = re.sub(r"\s*-\s*", " - ", cleaned)
     cleaned = cleaned.replace(" / Month", " / month").replace(" / Hour", " / hour")
     extracted = _extract_salary_from_text(cleaned)
     if extracted:
         cleaned = extracted
+    cleaned = re.sub(r"\b\d{4,6}\b", lambda match: f"{int(match.group(0)):,}".replace(",", " "), cleaned)
     return cleaned or "N/A"
 
 
@@ -502,6 +548,19 @@ def _enrich_record(
         )
         if fallback_notes:
             enriched["Notes"] = _clean_listing_summary(fallback_notes)
+    if (
+        enriched.get("Notes", "N/A") == "N/A"
+        or _looks_like_listing_summary(enriched.get("Notes", "N/A"))
+        or _looks_like_culture_or_perks_blurb(enriched.get("Notes", "N/A"))
+        or _looks_like_requirementish_notes_blob(enriched.get("Notes", "N/A"))
+    ):
+        role_summary = _extract_role_summary_from_text(
+            source_description,
+            source_notes,
+            description,
+        )
+        if role_summary:
+            enriched["Notes"] = _clean_listing_summary(role_summary)
 
     requirements_summary = _extract_summary_from_requirement_text(source_requirements)
     if requirements_summary and (
@@ -519,9 +578,20 @@ def _enrich_record(
     if enriched.get("Company description", "N/A") != "N/A":
         enriched["Company description"] = _clean_company_description(enriched["Company description"])
 
-    if _same_meaning_text(description, position):
+    current_description = enriched.get("Company description", "N/A")
+    if _same_meaning_text(current_description, position):
         enriched["Company description"] = "N/A"
-    if _same_meaning_text(notes, position) or _same_meaning_text(notes, enriched.get("Company description", "N/A")):
+    if _looks_like_formulaic_company_role_text(enriched.get("Company description", "N/A"), position, company):
+        enriched["Company description"] = "N/A"
+    current_notes = enriched.get("Notes", "N/A")
+    current_description = enriched.get("Company description", "N/A")
+    if _same_meaning_text(current_notes, position) or (
+        current_description != "N/A" and _same_meaning_text(current_notes, current_description)
+    ):
+        enriched["Notes"] = "N/A"
+    if _looks_like_formulaic_company_role_text(enriched.get("Notes", "N/A"), position, company):
+        enriched["Notes"] = "N/A"
+    if _looks_like_title_company_chrome(enriched.get("Notes", "N/A"), position, company):
         enriched["Notes"] = "N/A"
 
     enriched["Notes"] = _clean_listing_summary(enriched.get("Notes", "N/A"))
@@ -632,6 +702,14 @@ def _extract_location_from_text(*values: str) -> str:
 def _same_meaning_text(left: str, right: str) -> bool:
     normalize = lambda value: re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
     return bool(left and right and normalize(left) == normalize(right))
+
+
+def _normalize_overlap_text(value: str) -> str:
+    cleaned = _normalize_free_text(value)
+    if cleaned == "N/A":
+        return ""
+    cleaned = re.sub(r"(?<=[a-ząćęłńóśżź])(?=[A-ZŁŚŻŹĆĄĘÓŃ])", " ", cleaned)
+    return re.sub(r"[^a-z0-9ąćęłńóśżź]+", " ", cleaned.lower()).strip()
 
 
 def _strip_position_echo(value: str, position: str) -> str:
@@ -771,7 +849,11 @@ def _strip_leading_requirement_meta(source: str) -> str:
 
 def _should_reextract_salary(value: str) -> bool:
     lowered = value.lower()
-    return "kontr" in lowered or bool(re.search(r"\b\d\b\s+\d{1,3}\s+\d{3}\b", value))
+    return (
+        "kontr" in lowered
+        or "plnot" in lowered
+        or bool(re.search(r"\b\d\b\s+\d{1,3}\s+\d{3}\b", value))
+    )
 
 
 def _extract_summary_from_text(*values: str) -> str:
@@ -790,6 +872,12 @@ def _extract_summary_from_text(*values: str) -> str:
         "time commitment:",
         "compensation:",
         "wynagrodzenie:",
+        "nasze zasady",
+        "w czym możesz nam pomóc",
+        "pracując w naszym zespole zajmować się będziesz",
+        "what you will do",
+        "responsibilities",
+        "co będziesz robić",
     )
     for value in values:
         source = _drop_leading_metadata_segments(_normalize_free_text(value))
@@ -800,10 +888,139 @@ def _extract_summary_from_text(*values: str) -> str:
             lowered = segment.lower()
             if any(lowered.startswith(prefix) for prefix in bad_prefixes):
                 continue
+            if _looks_like_culture_or_perks_blurb(segment):
+                continue
             if len(segment) < 30:
                 continue
             return segment[:320].strip()
     return ""
+
+
+def _extract_role_summary_from_text(*values: str) -> str:
+    start_markers = (
+        "w czym możesz nam pomóc",
+        "pracując w naszym zespole zajmować się będziesz",
+        "what you'll do",
+        "what you will do",
+        "co będziesz robić",
+        "responsibilities",
+        "your responsibilities",
+    )
+    end_markers = (
+        "praca z nami to",
+        "what we offer",
+        "oferujemy",
+        "benefits",
+        "jak wygląda proces rekrutacji",
+        "how does the recruitment process look like",
+        "requirements",
+        "wymagania",
+    )
+    for value in values:
+        source = _normalize_missing(value)
+        if source == "N/A":
+            continue
+        section = _slice_section(source, start_markers, end_markers)
+        if not section:
+            continue
+        summary = _clean_role_summary(section)
+        if len(summary) >= 30:
+            return summary
+    return ""
+
+
+def _clean_role_summary(section: str) -> str:
+    cleaned = _normalize_free_text(section)
+    if cleaned == "N/A":
+        return ""
+    cleaned = cleaned.lstrip(" ?!-")
+
+    cleaned = _trim_after_markers(
+        cleaned,
+        (
+            "zapraszamy do zapoznania się",
+            "see our current projects",
+            "check out our current projects",
+            "learn more about our projects",
+        ),
+    ).strip(" -:")
+    if not cleaned:
+        return ""
+
+    implicit_prefixes = (
+        "Pracując w naszym zespole zajmować się będziesz",
+        "Working with our team, you will",
+        "In this role, you will",
+    )
+    if ":" not in cleaned:
+        for prefix in implicit_prefixes:
+            if cleaned.lower().startswith(prefix.lower() + " "):
+                cleaned = f"{prefix}: {cleaned[len(prefix):].strip()}"
+                break
+
+    if ":" not in cleaned:
+        return _first_sentence(cleaned)
+
+    prefix, payload = cleaned.split(":", 1)
+    prefix = prefix.strip()
+    payload = payload.strip()
+    if len(prefix) < 12 or len(payload) < 12:
+        return _first_sentence(cleaned)
+
+    items = _split_role_summary_items(payload)
+    if not items:
+        return _first_sentence(cleaned)
+
+    summary = f"{prefix}: {', '.join(items[:3])}".strip()
+    if summary and not re.search(r'[.!?]["”)]?$', summary):
+        summary = f"{summary}."
+    return summary
+
+
+def _split_role_summary_items(payload: str) -> list[str]:
+    cleaned = payload.strip()
+    if not cleaned:
+        return []
+
+    cleaned = re.sub(r"\s*[•·▪●]\s*", "\n", cleaned)
+    item_starters = (
+        "tworzeniem",
+        "rozwojem",
+        "utrzymaniem",
+        "wdrażaniem",
+        "projektowaniem",
+        "analizą",
+        "testowaniem",
+        "automatyzacją",
+        "budowaniem",
+        "koordynacją",
+        "implementacją",
+        "wspieraniem",
+        "przygotowaniem",
+        "dbaniem",
+        "opieką",
+        "building",
+        "developing",
+        "maintaining",
+        "supporting",
+        "designing",
+        "testing",
+        "analyzing",
+    )
+    for starter in item_starters:
+        cleaned = re.sub(rf"\s+oraz\s+(?={re.escape(starter)}\b)", "\n", cleaned, flags=re.I)
+        cleaned = re.sub(rf"(?<!^)\s+(?={re.escape(starter)}\b)", "\n", cleaned, flags=re.I)
+
+    items = [part.strip(" -:,") for part in re.split(r"\n+|;\s*", cleaned) if part.strip()]
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for item in items:
+        normalized = item.lower()
+        if len(item) < 6 or normalized in seen:
+            continue
+        seen.add(normalized)
+        deduped.append(item)
+    return deduped
 
 
 def _slice_section(source: str, start_markers: tuple[str, ...], end_markers: tuple[str, ...]) -> str:
@@ -900,6 +1117,11 @@ def _normalize_free_text(value: str) -> str:
     cleaned = unescape(cleaned).replace("\xa0", " ")
     cleaned = re.sub(r"<[^>]+>", " ", cleaned)
     cleaned = re.sub(r"(?<=[.!?])(?=[A-ZŁŚŻŹĆĄĘÓŃ])", " ", cleaned)
+    cleaned = re.sub(
+        r"(?<=[a-ząćęłńóśżź])(?=(?:This|As|In|Join|We|Our|At|Dołącz|Jako|W ramach)\b)",
+        " ",
+        cleaned,
+    )
     cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or "N/A"
 
@@ -983,6 +1205,58 @@ def _looks_like_title_prefixed_summary(value: str, position: str) -> bool:
     return cleaned_norm.startswith(title_norm[: max(18, len(title_norm) // 2)])
 
 
+def _looks_like_formulaic_company_role_text(value: str, position: str, company: str) -> bool:
+    cleaned = _normalize_free_text(value)
+    if cleaned == "N/A":
+        return False
+    lowered = cleaned.lower()
+    if len(cleaned) > 140:
+        return False
+
+    company_words = {
+        word
+        for word in re.sub(r"[^a-z0-9ąćęłńóśżź]+", " ", str(company or "").lower()).split()
+        if len(word) >= 3
+    }
+    position_words = {
+        word
+        for word in re.sub(r"[^a-z0-9ąćęłńóśżź]+", " ", str(position or "").lower()).split()
+        if len(word) >= 3
+    }
+    has_company_overlap = bool(company_words and sum(1 for word in company_words if word in lowered) >= 1)
+    has_position_overlap = bool(position_words and sum(1 for word in position_words if word in lowered) >= 1)
+    formula_markers = (" poszukuje ", " is looking for ", " oferta ", "praca:")
+    return has_company_overlap and has_position_overlap and any(marker in lowered for marker in formula_markers)
+
+
+def _looks_like_title_company_chrome(value: str, position: str, company: str) -> bool:
+    cleaned = _normalize_free_text(value)
+    if cleaned == "N/A":
+        return False
+    if len(cleaned) > 140 or re.search(r"[!?]", cleaned):
+        return False
+
+    normalized = _normalize_overlap_text(cleaned)
+    position_norm = _normalize_overlap_text(position)
+    company_norm = _normalize_overlap_text(company)
+    if not normalized or not position_norm or not company_norm:
+        return False
+
+    title_tokens = [token for token in position_norm.split() if len(token) >= 3]
+    company_tokens = [token for token in company_norm.split() if len(token) >= 2]
+    if not title_tokens or not company_tokens:
+        return False
+
+    title_overlap = sum(1 for token in set(title_tokens) if token in normalized)
+    company_overlap = sum(1 for token in set(company_tokens) if token in normalized)
+    badge_markers = ("nowość", "superoferta", "new", "featured", "śpiesz")
+    return (
+        title_overlap >= min(2, len(set(title_tokens)))
+        and company_overlap >= 1
+        and (len(cleaned.split()) <= 16 or any(marker in normalized for marker in badge_markers))
+    )
+
+
 def _normalize_requirement_boundaries(source: str) -> str:
     cleaned = source
     starters = (
@@ -1056,7 +1330,8 @@ def _normalize_requirement_boundaries(source: str) -> str:
     for starter in starters:
         cleaned = re.sub(rf"(?<!^)\s*(?={re.escape(starter)})", "\n", cleaned, flags=re.I)
         cleaned = re.sub(rf",(?={re.escape(starter)})", ",\n", cleaned, flags=re.I)
-    cleaned = re.sub(r"(?<!^)\s*(?=Minimum\s+\d)", "\n", cleaned)
+    cleaned = re.sub(r"(?<!^)\s*(?=Minimum\b)", "\n", cleaned)
+    cleaned = re.sub(r"(?<!^)\s*(?=Min\.\s*)", "\n", cleaned)
     cleaned = re.sub(r"(?<!^)\s+(?=(?:Polski|Angielski)\s*\()", "\n", cleaned)
     return cleaned
 
@@ -1068,6 +1343,8 @@ def _looks_like_requirement_item(value: str) -> bool:
     if _contains_job_meta_chrome(value):
         return False
     if _looks_like_culture_or_perks_blurb(value):
+        return False
+    if _looks_like_promotional_learning_blurb(value):
         return False
     if re.match(r"^(frontend|backend|full[\s-]?stack|mobile|devops|data)\s+(write|build|develop|design|maintain|support)\b", lowered):
         return False
@@ -1199,6 +1476,8 @@ def _clean_requirement_item(value: str) -> str:
     if "internship program" in lowered or "(evergreen)" in lowered or "(open)" in lowered:
         return ""
     if lowered.startswith(("'fullstackowa", "fullstackowa", "dodatkowymi atutami", "dodatkowe atuty")):
+        return ""
+    if _looks_like_promotional_learning_blurb(cleaned):
         return ""
     if re.match(r"^(frontend|backend|full[\s-]?stack|mobile|devops|data)\s+(write|build|develop|design|maintain|support)\b", lowered):
         return ""
@@ -1346,6 +1625,111 @@ def _normalize_leading_description_fragment(source: str) -> str:
     return cleaned
 
 
+def _strip_leading_job_meta(source: str) -> str:
+    cleaned = source.strip()
+    if not cleaned:
+        return cleaned
+
+    seniority_patterns = (
+        r"młodszy specjalista / młodsza specjalistka \(junior\)",
+        r"specjalista / specjalistka \(mid / regular\)",
+        r"junior specialist \(junior\)",
+        r"specialist \(mid / regular\)",
+        r"assistant, junior specialist",
+        r"praktykant / praktykantka",
+    )
+    label_names = (
+        "miejsce pracy",
+        "miejscowość",
+        "location",
+        "lokalizacja",
+        "wynagrodzenie",
+        "salary",
+        "poziom",
+        "seniority",
+        "model współpracy",
+        "employment model",
+        "czas trwania",
+        "duration",
+        "opis projektu",
+        "project description",
+        "system wynagrodzeń",
+        "rodzaj umowy",
+        "wymiar pracy",
+        "tryb pracy",
+        "forma zatrudnienia",
+        "typ umowy",
+    )
+    sentence_starters = (
+        "Osoba",
+        "At",
+        "We",
+        "This",
+        "Together",
+        "Join",
+        "Dołącz",
+        "Rozwijamy",
+        "Specjalizujemy",
+        "Utrzymanie",
+        "W ramach",
+        "Jako",
+        "Project",
+        "Poszukujemy",
+        "Be",
+        "As",
+        "Support",
+        "Design",
+        "Develop",
+        "Work",
+        "Contribute",
+    )
+    next_label_pattern = re.compile(
+        r"\b(?:"
+        + "|".join(re.escape(label) for label in label_names)
+        + r")\s*:\s*",
+        re.I,
+    )
+    sentence_pattern = re.compile(
+        r"\b(?:"
+        + "|".join(re.escape(starter) for starter in sentence_starters)
+        + r")\b"
+    )
+
+    for _ in range(8):
+        original = cleaned
+        for pattern in seniority_patterns:
+            cleaned = re.sub(rf"^\s*{pattern}\s*", "", cleaned, flags=re.I).strip()
+
+        label_match = re.match(
+            r"^\s*(?:"
+            + "|".join(re.escape(label) for label in label_names)
+            + r")\s*:\s*",
+            cleaned,
+            flags=re.I,
+        )
+        if label_match:
+            rest = cleaned[label_match.end() :].lstrip()
+            sentence_match = sentence_pattern.search(rest)
+            next_label_match = next_label_pattern.search(rest)
+            cut_index = None
+            if sentence_match and sentence_match.start() > 0:
+                cut_index = sentence_match.start()
+            if next_label_match and next_label_match.start() > 0:
+                cut_index = next_label_match.start() if cut_index is None else min(cut_index, next_label_match.start())
+            if cut_index is not None:
+                cleaned = rest[cut_index:].lstrip(" -:,")
+            elif len(rest) <= 80:
+                cleaned = ""
+            else:
+                cleaned = rest
+
+        cleaned = cleaned.strip()
+        if cleaned == original:
+            break
+
+    return cleaned.strip()
+
+
 def _strip_inline_section_labels(source: str, labels: tuple[str, ...]) -> str:
     cleaned = source
     for label in labels:
@@ -1371,6 +1755,102 @@ def _trim_after_markers(source: str, markers: tuple[str, ...]) -> str:
         if index != -1:
             end_index = min(end_index, index)
     return source[:end_index].strip()
+
+
+def _trim_after_role_transition(source: str) -> str:
+    cleaned = source.strip()
+    if not cleaned:
+        return cleaned
+
+    patterns = (
+        r"\bThis role has\b",
+        r"\bThis role is a strong fit if\b",
+        r"\bIn this role, you will\b",
+        r"\bAs an? [^.!?]{0,80}, you will\b",
+        r"\bWhat does the day-to-day work look like\??\b",
+        r"\bIn practice, you will\b",
+    )
+    earliest_cut: int | None = None
+    for pattern in patterns:
+        match = re.search(pattern, cleaned, flags=re.I)
+        if not match:
+            continue
+        cut_index = match.start()
+        if cut_index < 60:
+            continue
+        prefix = cleaned[:cut_index].strip()
+        if len(prefix) < 40:
+            continue
+        if earliest_cut is None or cut_index < earliest_cut:
+            earliest_cut = cut_index
+
+    if earliest_cut is None:
+        return cleaned
+    trimmed = cleaned[:earliest_cut].rstrip(" -:,")
+    if trimmed and not re.search(r'[.!?]["”)]?$', trimmed):
+        trimmed = f"{trimmed}."
+    return trimmed
+
+
+def _looks_like_task_heavy_description(value: str) -> bool:
+    cleaned = _normalize_free_text(value)
+    if cleaned == "N/A":
+        return False
+
+    sentences = [part.strip() for part in re.split(r"(?<=[.!?])\s+", cleaned) if part.strip()]
+    if len(sentences) < 2:
+        return False
+
+    responsibility_starters = (
+        "Contribute",
+        "Triage",
+        "Design",
+        "Develop",
+        "Operate",
+        "Diagnose",
+        "Collaborate",
+        "Participate",
+        "Support",
+        "Build",
+        "Implement",
+        "Drive",
+        "Own",
+        "Maintain",
+        "Write",
+        "Create",
+    )
+    first_sentences = sentences[:4]
+    responsibility_hits = sum(
+        1 for sentence in first_sentences if re.match(rf"^(?:{'|'.join(responsibility_starters)})\b", sentence, flags=re.I)
+    )
+    context_markers = (" we ", " our ", " team ", " company ", " mission ", " organization ", " organizacja ", " zesp", " firma ")
+    padded = f" {cleaned[:260].lower()} "
+    has_context = any(marker in padded for marker in context_markers)
+    return responsibility_hits >= 2 and not has_context
+
+
+def _looks_like_work_condition_blurb(value: str) -> bool:
+    cleaned = _normalize_free_text(value)
+    if cleaned == "N/A":
+        return False
+    if len(cleaned) > 160:
+        return False
+
+    lowered = cleaned.lower()
+    condition_markers = (
+        "shift",
+        "shifts",
+        "on call",
+        "on-call",
+        "24/7",
+        "support on call",
+        "praca zmianowa",
+        "dyżur",
+        "dyzur",
+    )
+    context_markers = (" we ", " our ", " team ", " company ", " mission ", " organizacja ", " zesp", " firma ")
+    padded = f" {lowered} "
+    return any(marker in padded for marker in condition_markers) and not any(marker in padded for marker in context_markers)
 
 
 def _normalize_requirement_labels(source: str) -> str:
@@ -1786,6 +2266,74 @@ def _looks_like_culture_or_perks_blurb(value: str) -> bool:
     return sum(1 for marker in culture_markers if marker in lowered) >= 2 and not any(
         marker in lowered for marker in role_markers
     )
+
+
+def _looks_like_requirementish_notes_blob(value: str) -> bool:
+    lowered = _normalize_free_text(value).lower()
+    if lowered == "n/a":
+        return False
+    if len(lowered) < 60 or re.search(r"(?<=[.!?])\s", lowered):
+        return False
+
+    markers = (
+        "znajomość",
+        "doświadczenie",
+        "english",
+        "angielski",
+        "wymagania",
+        "requirements",
+        "mile widziana",
+        "python",
+        "sql",
+        "django",
+    )
+    if "w czym możesz nam pomóc" in lowered or "what you will do" in lowered:
+        return True
+    return sum(1 for marker in markers if marker in lowered) >= 4
+
+
+def _looks_like_promotional_learning_blurb(value: str) -> bool:
+    lowered = _normalize_free_text(value).lower()
+    if lowered == "n/a":
+        return False
+    if len(lowered) < 30 or len(lowered) > 220:
+        return False
+
+    role_markers = (
+        "python",
+        "java",
+        "sql",
+        "django",
+        "experience",
+        "doświadczenie",
+        "znajomość",
+        "minimum",
+        "student",
+        "studiujesz",
+        "godzin",
+        "wykształcenie",
+        "wymagania",
+        "requirements",
+    )
+    if any(marker in lowered for marker in role_markers):
+        return False
+
+    promo_markers = (
+        "przekuj teorię w praktykę",
+        "theory into practice",
+        "od naszych ekspert",
+        "our experts",
+        "zobacz, jak wygląda praca",
+        "see what work looks like",
+        "dużej organizacji",
+        "large organization",
+        "pierwsze kroki na rynku pracy",
+        "start your career",
+        "przeżyj tę przygodę z nami",
+        "gain knowledge and skills",
+        "zdobądź wiedzę i umiejętności",
+    )
+    return any(marker in lowered for marker in promo_markers)
 
 
 def _looks_like_cta_question(value: str) -> bool:
