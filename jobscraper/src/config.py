@@ -1,5 +1,7 @@
+import os
+
 # DEFAULT_OPENAI_MODEL = "openrouter/google/gemini-2.5-flash-lite"
-DEFAULT_OPENAI_MODEL = "openrouter/openai/gpt-5-mini"
+DEFAULT_OPENAI_MODEL = os.getenv("OPENAI_MODEL", "openai/gpt-4o-mini")
 # DEFAULT_OPENAI_MODEL = "openrouter/openai/gpt-5-nano"
 # DEFAULT_OPENAI_MODEL = "openrouter/openai/gpt-4o-mini"
 

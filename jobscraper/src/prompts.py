@@ -6,6 +6,13 @@ Use these prefixes in your responses:
 🔧 when mentioning tool usage
 ✅ when reporting completion
 
+Global browsing rules (apply to EVERY page you open with Playwright):
+- After each navigation or page load, first check for cookie banners or privacy popups.
+- Prefer clicking **Accept** on cookie/consent banners so that the main page content becomes fully visible.
+- Only close/decline if there is no clear "Accept" option, and make sure the banner will not keep reappearing.
+- If multiple banners or overlays appear, clear all of them before reading or extracting content.
+- Never scrape or reason about content that is hidden behind a cookie or privacy overlay.
+
 Be conversational and explain each step ultra briefly. When delivering final answer, send ONLY a JSON array (no prefixes).
 """
 
@@ -35,7 +42,10 @@ STEP 2: Extract Full Text
 1. Navigate to each job detail page
 2. Wait for main content to fully load (use appropriate wait strategies)
 3. Confirm you're on the job detail page, not a list page
-4. Dismiss any sign-in prompts, cookie banners, or overlays to access content
+4. Actively handle any cookie consent banners or popups:
+    - Accept or close them so that the job content is fully visible.
+    - If multiple banners appear, clear them all before extracting data.
+    - Never scrape content that is hidden behind a cookie or privacy overlay.
 
 STEP 3: Parse Data - FACTUAL EXTRACTION ONLY
 
@@ -106,8 +116,10 @@ STEP 2: Extract Full Text
 1. Navigate to each job detail page
 2. Wait for main content to fully load (use appropriate wait strategies)
 3. Confirm you're on the job detail page, not a list page
-4. Dismiss any sign-in prompts, cookie banners, or overlays to access content
-
+4. Actively handle any cookie consent banners or popups:
+    - Accept or close them so that the job content is fully visible.
+    - If multiple banners appear, clear them all before extracting data.
+    - Never scrape content that is hidden behind a cookie or privacy overlay.
 
 STEP 3: Parse Data - FACTUAL EXTRACTION ONLY
 

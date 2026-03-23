@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import json
 import os
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
@@ -168,6 +167,40 @@ class AirtableClient:
             return table.all(sort=[sort_by])
         else:
             return table.all()
+
+    def get_record(self, record_id: str, fields: Optional[List[str]] = None) -> Optional[Dict[str, Any]]:
+        """Fetch a single record from the offers table by Airtable record ID."""
+        table = self._connect()
+        try:
+            return table.get(record_id, fields=fields)
+        except Exception as exc:  # noqa: BLE001 - pyairtable raises generic exceptions
+            console.print(Panel(
+                f"Failed to fetch Airtable record {record_id}: {exc}",
+                title="Airtable",
+                style="red",
+            ))
+            return None
+
+    def batch_update_records(self, updates: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        """Batch update multiple records in the offers table."""
+        if not updates:
+            return []
+
+        table = self._connect()
+        results: List[Dict[str, Any]] = []
+        chunk_size = 10  # Airtable API limit per request
+
+        for i in range(0, len(updates), chunk_size):
+            chunk = updates[i : i + chunk_size]
+            try:
+                results.extend(table.batch_update(chunk))
+            except Exception as exc:  # noqa: BLE001
+                console.print(Panel(
+                    f"Failed to update Airtable records chunk starting at index {i}: {exc}",
+                    title="Airtable",
+                    style="red",
+                ))
+        return results
 
     @staticmethod
     def _normalize_record(record: Dict[str, Any]) -> Dict[str, Any]:

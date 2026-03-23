@@ -1,0 +1,52 @@
+{
+  "preferred_locations": [
+    "Remote",
+    "Wrocław",
+    "Poznań",
+    "Łódź",
+    "Katowice"
+  ],
+  "preferred_employment_types": [
+    "B2B",
+    "UoP"
+  ],
+  "minimum_salary_pln": 5000,
+  "experience_levels": [
+    "Junior",
+    "Entry",
+    "Intern"
+  ],
+  "required_keywords": [
+    "Python",
+    "FastAPI",
+    "SQL",
+    "PostgreSQL",
+    "Git"
+  ],
+  "preferred_keywords": [
+    "Docker",
+    "pytest",
+    "CI/CD",
+    "Linux",
+    "Redis"
+  ],
+  "bonus_keywords": [
+    "AWS",
+    "Kubernetes",
+    "Airflow",
+    "Playwright",
+    "LLM"
+  ],
+  "excluded_keywords": [
+    "Senior",
+    "Lead",
+    "Principal",
+    "Staff",
+    "Manager"
+  ],
+  "hard_rule_messages": {
+    "missing_required_keywords": "Score 0: offer must mention ({keywords}).",
+    "missing_junior_keywords": "Score 0: missing junior-level keywords ({keywords}).",
+    "contains_excluded_keywords": "Score 0: senior-level wording detected."
+  }
+}
