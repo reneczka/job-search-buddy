@@ -49,6 +49,7 @@ COMPANY_DESCRIPTION_NOISE_PATTERNS = (
     r"opis stanowiska.*",
     r"pełny opis stanowiska.*",
     r"świadczenia na podstawie pełnego opisu stanowiska.*",
+    r"is the employer listed for this position.*",
 )
 CHROME_MARKERS = (
     "utwórz konto indeed",
@@ -56,6 +57,17 @@ CHROME_MARKERS = (
     "pełny opis stanowiska",
     "na podstawie pełnego opisu stanowiska",
     "przejdź od razu do głównej zawartości",
+)
+NOTES_NOISE_PATTERNS = (
+    r"(?i)^aplikacja w witrynie firmy$",
+    r"(?i)^utwórz konto indeed.*",
+    r"(?i)^application consent and privacy notices present$",
+    r"(?i)^privacy notices present$",
+    r"(?i)^employer collects applications via external (?:system|form)$",
+    r"(?i)^employer application via external (?:system|form)$",
+    r"(?i)^application via employer'?s external (?:system|form)$",
+    r"(?i)^apply via (?:external|company) (?:system|form|site|website)$",
+    r"(?i)^recruitment via (?:external|employer'?s external) (?:system|form)$",
 )
 LOCATION_LABEL_PATTERNS = (
     r"(?i)\bmiejsce pracy\b\s*:\s*",
@@ -79,7 +91,7 @@ NON_CITY_LOCATION_MARKERS = {
     "cala polska",
 }
 WORK_MODE_PATTERNS = (
-    ("Remote", ("remote", "praca zdalna", "zdalna", "remote work")),
+    ("Remote", ("remote", "praca zdalna", "zdalna", "zdalnie", "remote work", "remotely")),
     ("Hybrid", ("hybrid", "hybryd", "partially remote")),
     ("On-site", ("on-site", "on site", "stacjon", "office")),
 )
@@ -138,20 +150,42 @@ SHORT_REQUIREMENT_CONNECTOR_PATTERNS = (
     r"\s+i/lub\s+",
     r"\s+oraz\s+",
 )
+ADDRESS_HINT_PATTERNS = (
+    r"(?i)\bul\.?\b",
+    r"(?i)\balej[aei]\b",
+    r"(?i)\bal\.?\b",
+    r"(?i)\bplac\b",
+    r"(?i)\bpl\.?\b",
+    r"(?i)\bstreet\b",
+    r"(?i)\bst\.?\b",
+    r"(?i)\broad\b",
+    r"(?i)\brd\.?\b",
+    r"(?i)\bavenue\b",
+    r"(?i)\bave\.?\b",
+)
 
 
 def to_airtable_record(detail: JobDetail) -> dict[str, str]:
+    company = _normalize_company(detail.company)
     salary = _normalize_salary(detail.salary)
+    location = _normalize_location(
+        detail.location,
+        fallback_text="; ".join(part for part in (detail.notes, detail.company_description) if _normalize_scalar(part)),
+    )
     requirements = _normalize_requirements(detail.requirements)
-    notes = _normalize_notes(detail.notes)
-    company_description = _normalize_company_description(detail.company_description)
+    notes = _normalize_notes(detail.notes, company=company)
+    company_description = _normalize_company_description(
+        detail.company_description,
+        company=company,
+        position=_normalize_position(detail.position),
+    )
     return {
         "Source": _value(detail.source),
         "Link": _value(detail.final_url or detail.discovered_url),
-        "Company": _value(_normalize_company(detail.company)),
+        "Company": _value(company),
         "Position": _value(_normalize_position(detail.position)),
         "Salary": _value(salary),
-        "Location": _value(_normalize_location(detail.location)),
+        "Location": _value(location),
         "Notes": _value(notes),
         "Requirements": _value(_requirements_value(requirements)),
         "Company description": _value(company_description),
@@ -267,20 +301,22 @@ def _normalize_salary(value: str) -> str:
     return cleaned
 
 
-def _normalize_location(value: str) -> str:
+def _normalize_location(value: str, fallback_text: str = "") -> str:
     cleaned = _normalize_scalar(value)
-    if not cleaned:
+    fallback_cleaned = _normalize_scalar(fallback_text)
+    if not cleaned and not fallback_cleaned:
         return ""
     for pattern in LOCATION_LABEL_PATTERNS:
         cleaned = re.sub(pattern, "", cleaned)
+        fallback_cleaned = re.sub(pattern, "", fallback_cleaned)
 
     candidates: list[str] = []
     for segment in re.split(r"[;/|]", cleaned):
-        candidate = _extract_city_candidate(segment)
-        if candidate and candidate not in candidates:
-            candidates.append(candidate)
+        for candidate in _extract_city_candidates(segment):
+            if candidate and candidate not in candidates:
+                candidates.append(candidate)
     if not candidates:
-        mode = _extract_work_mode(cleaned)
+        mode = _extract_work_mode(cleaned) or _extract_work_mode(fallback_cleaned)
         return mode
     return ", ".join(candidates)
 
@@ -293,6 +329,7 @@ def _normalize_requirements(values: list[str]) -> list[str]:
             if not normalized_item:
                 continue
             normalized.append(normalized_item)
+    normalized = _compact_repeated_prefix_requirements(normalized)
     return _drop_redundant_requirements(normalized)
 
 
@@ -331,7 +368,14 @@ def _expand_colon_requirement_list(value: str) -> list[str]:
     prefix, tail = value.split(":", 1)
     if not prefix.strip() or not tail.strip():
         return []
-    if not any(marker in prefix.lower() for marker in LIST_PREFIX_MARKERS):
+    lowered_prefix = prefix.lower().strip()
+    if not any(marker in lowered_prefix for marker in LIST_PREFIX_MARKERS):
+        if not (
+            len(lowered_prefix.split()) <= 3
+            and re.search(r"\b(?:basic|basics|podstawy|znasz)\b", lowered_prefix, flags=re.IGNORECASE)
+        ):
+            return []
+    if re.search(r"\b(?:two or more|following|poniższych|powyższych)\b", value, flags=re.IGNORECASE):
         return []
     parts = _split_short_requirement_parts(tail)
     return parts if len(parts) > 1 else []
@@ -341,6 +385,8 @@ def _expand_short_requirement_list(value: str) -> list[str]:
     if "(" in value or ")" in value:
         return []
     if len(value) > 90:
+        return []
+    if re.search(r"\b(?:two or more|following|poniższych|powyższych)\b", value, flags=re.IGNORECASE):
         return []
     if not any(token in value for token in (" / ", ",", ";")) and not re.search(
         r"\b(?:and/or|i/lub|oraz)\b",
@@ -411,31 +457,66 @@ def _canonical_requirement(value: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _normalize_notes(value: str) -> str:
+def _normalize_notes(value: str, company: str = "") -> str:
     cleaned = _normalize_scalar(value)
     if not cleaned:
         return ""
-    lines = [_normalize_scalar(part) for part in re.split(r"[\n\r]+", cleaned)]
-    parts = [part for part in lines if part]
-    compact = "; ".join(parts) if len(parts) > 1 else cleaned
+    raw_parts = [_normalize_scalar(part) for part in re.split(r"[;\n\r]+", cleaned)]
+    parts: list[str] = []
+    for part in raw_parts:
+        normalized_part = _normalize_note_part(part)
+        if not normalized_part:
+            continue
+        if _is_company_only_note(normalized_part, company):
+            continue
+        parts.append(normalized_part)
+    compact = "; ".join(parts) if len(parts) > 1 else (parts[0] if parts else "")
+    if not compact:
+        return ""
     compact = re.sub(r"\s*;\s*", "; ", compact)
     compact = re.sub(r"\s{2,}", " ", compact).strip(" ;")
     return _truncate_text(compact, max_chars=420, max_sentences=3)
 
 
-def _normalize_company_description(value: str) -> str:
+def _normalize_note_part(value: str) -> str:
     cleaned = _normalize_scalar(value)
     if not cleaned:
         return ""
+    cleaned = re.sub(r"(?i)^(?:recruitment|rekrutacja)\s*:\s*", "Recruitment: ", cleaned)
+    cleaned = re.sub(r"(?i)^(?:benefits|benefity)\s*:\s*", "Benefits: ", cleaned)
+    cleaned = re.sub(r"(?i)^(?:contract|forma współpracy|formy współpracy)\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"(?i)^(?:work mode|tryb pracy)\s*:\s*", "", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -;:")
+    if not cleaned:
+        return ""
+    for pattern in NOTES_NOISE_PATTERNS:
+        if re.search(pattern, cleaned):
+            return ""
+    return cleaned
+
+
+def _normalize_company_description(value: str, company: str = "", position: str = "") -> str:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"(?<=[a-ząćęłńóśźż])(?=[A-ZĄĆĘŁŃÓŚŹŻ])", " ", cleaned)
+    cleaned = re.sub(r"(?<=[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż])(?=\d)", " ", cleaned)
+    cleaned = re.sub(r"(?<=\d)(?=[A-Za-zĄĆĘŁŃÓŚŹŻąćęłńóśźż])", " ", cleaned)
     for pattern in COMPANY_DESCRIPTION_NOISE_PATTERNS:
         cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE | re.DOTALL)
     cleaned = re.sub(r"\bO firmie\s+", "", cleaned, flags=re.IGNORECASE)
+    cleaned = re.sub(r"(?i)(?:^|[;,.]\s*)n/?a(?:$|[;,.]\s*)", " ", cleaned)
     cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -;")
     if not cleaned:
         return ""
+    if not re.search(r"[.!?]", cleaned) and re.search(r"\d", cleaned):
+        return ""
+    if _is_name_only_company_description(cleaned, company, position):
+        return ""
     if len(cleaned.split()) < 5:
         return ""
-    return _truncate_text(cleaned, max_chars=380, max_sentences=2)
+    truncated = _truncate_text(cleaned, max_chars=380, max_sentences=2)
+    return "" if _is_name_only_company_description(truncated, company, position) else truncated
 
 
 def _drop_redundant_requirements(values: list[str]) -> list[str]:
@@ -470,6 +551,47 @@ def _drop_redundant_requirements(values: list[str]) -> list[str]:
     return filtered
 
 
+def _compact_repeated_prefix_requirements(values: list[str]) -> list[str]:
+    grouped_tails: dict[str, list[str]] = {}
+    ordered_prefixes: list[str] = []
+    passthrough: list[str] = []
+
+    for value in values:
+        prefix_payload = _repeated_requirement_prefix(value)
+        if not prefix_payload:
+            passthrough.append(value)
+            continue
+        prefix, tail = prefix_payload
+        if prefix not in grouped_tails:
+            grouped_tails[prefix] = []
+            ordered_prefixes.append(prefix)
+        if tail not in grouped_tails[prefix]:
+            grouped_tails[prefix].append(tail)
+
+    if not ordered_prefixes:
+        return values
+
+    compacted: list[str] = []
+    emitted_prefixes: set[str] = set()
+    passthrough_index = 0
+    for value in values:
+        prefix_payload = _repeated_requirement_prefix(value)
+        if not prefix_payload:
+            compacted.append(passthrough[passthrough_index])
+            passthrough_index += 1
+            continue
+        prefix, _tail = prefix_payload
+        if prefix in emitted_prefixes:
+            continue
+        emitted_prefixes.add(prefix)
+        tails = grouped_tails.get(prefix) or []
+        if len(tails) == 1:
+            compacted.append(f"{prefix}: {tails[0]}")
+            continue
+        compacted.append(f"{prefix}: {', '.join(tails)}")
+    return compacted
+
+
 def _requirement_skill_signature(value: str) -> str:
     cleaned = _normalize_scalar(value)
     if not cleaned:
@@ -493,26 +615,47 @@ def _requirement_contains_signature(value: str, signature: str) -> bool:
     return normalized != signature and f" {signature} " in f" {normalized} "
 
 
-def _extract_city_candidate(value: str) -> str:
+def _repeated_requirement_prefix(value: str) -> tuple[str, str] | None:
+    cleaned = _normalize_scalar(value)
+    if not cleaned or ":" not in cleaned:
+        return None
+    prefix, tail = cleaned.split(":", 1)
+    prefix = prefix.strip(" -;:")
+    tail = tail.strip(" -;:")
+    if not prefix or not tail:
+        return None
+    lowered_prefix = prefix.lower()
+    if not any(marker in lowered_prefix for marker in ("following", "poniższych", "powyższych")):
+        return None
+    return prefix, tail
+
+
+def _extract_city_candidates(value: str) -> list[str]:
     cleaned = _normalize_scalar(value)
     if not cleaned:
-        return ""
+        return []
     cleaned = re.sub(r"\([^)]*\)", lambda match: match.group(0).replace(",", ";"), cleaned)
     cleaned = re.sub(r"[()]", "", cleaned)
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;")
     if not cleaned:
-        return ""
+        return []
 
-    parts = [part.strip(" ,;") for part in re.split(r"[;,]", cleaned) if part.strip(" ,;")]
+    address_like = bool(re.search(r"\d", cleaned)) or any(
+        re.search(pattern, cleaned) for pattern in ADDRESS_HINT_PATTERNS
+    )
+    normalized = re.sub(r"\b(?:and|oraz| i )\b", ",", cleaned, flags=re.IGNORECASE)
+    parts = [part.strip(" ,;") for part in re.split(r"[;,]", normalized) if part.strip(" ,;")]
     if not parts:
-        return ""
+        return []
 
-    ordered_parts = parts if not any(char.isdigit() for char in parts[0]) else list(reversed(parts))
-    for part in ordered_parts:
+    candidates: list[str] = []
+    for part in parts:
         city = _clean_location_part(part)
-        if city:
-            return city
-    return ""
+        if city and city not in candidates:
+            candidates.append(city)
+    if not candidates:
+        return []
+    return [candidates[-1]] if address_like else candidates
 
 
 def _extract_work_mode(value: str) -> str:
@@ -542,6 +685,48 @@ def _clean_location_part(value: str) -> str:
     if lowered.endswith(("skie", "ckie", "dzkie")) and cleaned == cleaned.lower():
         return ""
     return cleaned
+
+
+def _canonical_company_text(value: str) -> str:
+    cleaned = _normalize_scalar(value).lower()
+    cleaned = re.sub(r"[^a-z0-9ąćęłńóśźż]+", " ", cleaned)
+    return re.sub(r"\s+", " ", cleaned).strip()
+
+
+def _is_company_only_note(value: str, company: str) -> bool:
+    note_key = _canonical_company_text(value)
+    company_key = _canonical_company_text(company)
+    if not note_key:
+        return True
+    if not company_key:
+        return False
+    return note_key == company_key
+
+
+def _is_name_only_company_description(value: str, company: str, position: str = "") -> bool:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return True
+    description_key = _canonical_company_text(cleaned)
+    company_key = _canonical_company_text(company)
+    position_key = _canonical_company_text(position)
+    if company_key and description_key == company_key:
+        return True
+    if company_key and description_key.startswith(company_key):
+        remainder = description_key.removeprefix(company_key).strip()
+        if not remainder or remainder in {"n a", "na"}:
+            return True
+    stripped = description_key
+    for marker in (company_key, position_key):
+        if marker:
+            stripped = stripped.replace(marker, " ")
+    stripped = stripped.replace("employer listed for this position", " ")
+    stripped = re.sub(r"\b(?:remote|hybrid|on site|on-site|zdalna|zdalnie|hybrydowo)\b", " ", stripped)
+    stripped = re.sub(r"\b(?:sp z o o|s a|sa)\b", " ", stripped)
+    stripped = re.sub(r"\s+", " ", stripped).strip()
+    if len(stripped.split()) < 3:
+        return True
+    return False
 
 
 def _truncate_text(value: str, max_chars: int, max_sentences: int) -> str:

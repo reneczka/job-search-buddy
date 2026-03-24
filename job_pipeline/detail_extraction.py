@@ -19,6 +19,7 @@ console = Console()
 MIN_PRIMARY_CONTENT_CHARS = 450
 MAX_FALLBACK_TEXT_CHARS = 12000
 MAX_MAIN_TEXT_CHARS = 10000
+DETAIL_CACHE_VERSION = "v5"
 SIGNATURE_TEXT_CHARS = 2500
 SIGNATURE_META_CHARS = 300
 SIGNATURE_TITLE_CHARS = 200
@@ -184,6 +185,7 @@ async def _extract_payload(runtime: StagehandRuntime, content: PageContentSnapsh
         "if hidden, placeholder, or unspecified, return 'N/A'. "
         "location: city name only when a city is explicitly shown; remove street names, building numbers, districts, postal codes, "
         "country-only labels, and UI labels like 'Miejsce pracy'. "
+        "If multiple cities are explicitly listed, keep all city names only in one concise comma-separated field. "
         "If no city is shown but the work mode is explicit, return only 'Remote', 'Hybrid', or 'On-site'. "
         "requirements: only explicit requirements as short bullet-ready items; no section labels like 'Soft skills', "
         "'Technical skills', 'Optional', 'Nice to have', or duplicated items. "
@@ -191,6 +193,11 @@ async def _extract_payload(runtime: StagehandRuntime, content: PageContentSnapsh
         "Do not combine multiple requirements into one item with commas, semicolons, slashes, or 'and'. "
         "Split grouped skills or expectations into separate items whenever they are independently understandable. "
         "Split grouped location-eligibility requirements like 'Located in CityA/CityB/CityC' into separate items. "
+        "Do not split shared-prefix requirements when splitting would repeat the same lead-in or lose meaning, "
+        "for example phrases like 'two or more of the following'. Keep those as one coherent item. "
+        "Never drop explicit technologies, frameworks, tools, or languages from the source text. "
+        "When a requirement line lists named basics after a shared prefix like 'basic knowledge of' or "
+        "'Znasz podstawy:', keep every named technology as its own item, for example Python, Django, SQL, Git. "
         "Do not include responsibilities, tasks, benefits, or generic filler if they are not real requirements. "
         "If the same skill appears both as a short standalone item and as part of a richer requirement, keep only the richer item. "
         "Keep each item short and concrete. "
@@ -198,7 +205,7 @@ async def _extract_payload(runtime: StagehandRuntime, content: PageContentSnapsh
         "do not dump long page text. "
         "company_description: 1-2 short factual sentences about the employer only; do not include job-description text, "
         "application instructions, platform chrome, or marketing boilerplate. "
-        "If no reliable company description is present, return 'N/A'."
+        "If no reliable company description is present, or the only text is the company name, return 'N/A'."
     )
 
     try:
@@ -483,7 +490,7 @@ def _content_signature(content: PageContentSnapshot) -> str:
     primary_text = _signature_text(content.content_text or content.fallback_text, limit=SIGNATURE_TEXT_CHARS)
     title_text = _signature_text(content.page_title, limit=SIGNATURE_TITLE_CHARS)
     meta_text = _signature_text(content.meta_description, limit=SIGNATURE_META_CHARS)
-    payload = "\n".join((primary_text, title_text, meta_text))
+    payload = "\n".join((DETAIL_CACHE_VERSION, primary_text, title_text, meta_text))
     return hashlib.sha1(payload.encode("utf-8")).hexdigest()
 
 
