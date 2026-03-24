@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import re
 from dataclasses import dataclass
 from typing import Any
@@ -8,6 +9,7 @@ from playwright.async_api import Error as PlaywrightError
 from pydantic import BaseModel, Field
 from rich.console import Console
 
+from .detail_cache import get_detail_cache
 from .models import JobDetail
 from .stagehand_session import StagehandRuntime, scoped_model_options, sleep_ms
 from .url_discovery import accept_cookies, normalize_page_url
@@ -17,6 +19,13 @@ console = Console()
 MIN_PRIMARY_CONTENT_CHARS = 450
 MAX_FALLBACK_TEXT_CHARS = 12000
 MAX_MAIN_TEXT_CHARS = 10000
+SIGNATURE_TEXT_CHARS = 2500
+SIGNATURE_META_CHARS = 300
+SIGNATURE_TITLE_CHARS = 200
+VOLATILE_SIGNATURE_PATTERNS = (
+    r"\b\d+\s+(?:min(?:ute)?s?|godz(?:iny)?|hours?|days?)\b",
+    r"\b\d{1,2}:\d{2}\b",
+)
 MISSING_MARKERS = {"", "n/a", "na", "none", "null", "unknown", "not available", "not provided"}
 
 
@@ -43,7 +52,32 @@ class PageContentSnapshot:
 
 
 async def extract_job_detail(runtime: StagehandRuntime, source_name: str, url: str) -> JobDetail:
-    page = await runtime.ensure_page()
+    first_pass = await _extract_job_detail_once(runtime, source_name, url)
+    if not _should_retry_detail(first_pass):
+        _store_detail_cache(first_pass)
+        return first_pass
+
+    console.print(f"DETAIL_RETRY site={source_name} reason=broken_first_pass url={url}")
+    try:
+        retry_pass = await _extract_job_detail_once(runtime, source_name, url, force_new_page=True)
+    except Exception as exc:
+        first_pass.raw["retry_attempted"] = True
+        first_pass.raw["retry_error"] = str(exc)
+        return first_pass
+
+    chosen = retry_pass if _detail_score(retry_pass) > _detail_score(first_pass) else first_pass
+    chosen.raw["retry_attempted"] = True
+    _store_detail_cache(chosen)
+    return chosen
+
+
+async def _extract_job_detail_once(
+    runtime: StagehandRuntime,
+    source_name: str,
+    url: str,
+    force_new_page: bool = False,
+) -> JobDetail:
+    page = await runtime.ensure_page(force_new=force_new_page)
     page = await _navigate_with_page_recovery(runtime, page, url)
     await sleep_ms(1200)
     await accept_cookies(runtime, page)
@@ -56,7 +90,7 @@ async def extract_job_detail(runtime: StagehandRuntime, source_name: str, url: s
             discovered_url=url,
             final_url=final_url,
             notes=page_error,
-            raw={"page_error": page_error},
+            raw={"page_error": page_error, "retry_used": force_new_page},
         )
 
     content = await _capture_page_content(page)
@@ -64,6 +98,33 @@ async def extract_job_detail(runtime: StagehandRuntime, source_name: str, url: s
         f"DETAIL_CONTENT selector={content.selector or '-'} "
         f"content_chars={content.content_chars} fallback_chars={content.fallback_chars}"
     )
+    content_signature = _content_signature(content)
+    cache_key = normalize_page_url(page.url) or url
+    cached_payload = get_detail_cache().get(cache_key, content_signature)
+    if cached_payload:
+        console.print(f"DETAIL_CACHE_HIT=true url={cache_key}")
+        return JobDetail(
+            source=source_name,
+            discovered_url=url,
+            final_url=cache_key,
+            company=_normalize_missing_marker(cached_payload.get("company")),
+            position=_normalize_missing_marker(cached_payload.get("position")),
+            salary=_normalize_missing_marker(cached_payload.get("salary")),
+            location=_normalize_missing_marker(cached_payload.get("location")),
+            notes=_normalize_missing_marker(cached_payload.get("notes")),
+            requirements=_normalize_requirements(cached_payload.get("requirements") or []),
+            company_description=_normalize_missing_marker(cached_payload.get("company_description")),
+            raw={
+                "cache_hit": True,
+                "content_signature": content_signature,
+                "content_selector": content.selector,
+                "content_chars": content.content_chars,
+                "fallback_chars": content.fallback_chars,
+                "selector_fallback_used": False,
+                "retry_used": force_new_page,
+                "retry_attempted": False,
+            },
+        )
 
     payload, used_broad_fallback = await _extract_payload(runtime, content)
     fallback = await _fallback_page_data(page, content)
@@ -97,6 +158,10 @@ async def extract_job_detail(runtime: StagehandRuntime, source_name: str, url: s
             "content_chars": content.content_chars,
             "fallback_chars": content.fallback_chars,
             "selector_fallback_used": used_broad_fallback,
+            "content_signature": content_signature,
+            "cache_hit": False,
+            "retry_used": force_new_page,
+            "retry_attempted": False,
         },
     )
 
@@ -114,10 +179,21 @@ async def _extract_payload(runtime: StagehandRuntime, content: PageContentSnapsh
         "Use these field rules strictly: "
         "company: employer name only. "
         "position: core job title only; remove decorative suffixes or labels that are not part of the role. "
-        "salary: return exact visible salary only; if hidden, placeholder, or unspecified, return 'N/A'. "
-        "location: short readable location only; remove UI labels like 'Miejsce pracy'. "
+        "salary: return visible salary text only, stripped of labels like 'Salary' or 'Wynagrodzenie'; "
+        "if multiple contract-specific salary variants are explicitly shown, keep them in one concise field; "
+        "if hidden, placeholder, or unspecified, return 'N/A'. "
+        "location: city name only when a city is explicitly shown; remove street names, building numbers, districts, postal codes, "
+        "country-only labels, and UI labels like 'Miejsce pracy'. "
+        "If no city is shown but the work mode is explicit, return only 'Remote', 'Hybrid', or 'On-site'. "
         "requirements: only explicit requirements as short bullet-ready items; no section labels like 'Soft skills', "
         "'Technical skills', 'Optional', 'Nice to have', or duplicated items. "
+        "Each list item must contain exactly one requirement only. "
+        "Do not combine multiple requirements into one item with commas, semicolons, slashes, or 'and'. "
+        "Split grouped skills or expectations into separate items whenever they are independently understandable. "
+        "Split grouped location-eligibility requirements like 'Located in CityA/CityB/CityC' into separate items. "
+        "Do not include responsibilities, tasks, benefits, or generic filler if they are not real requirements. "
+        "If the same skill appears both as a short standalone item and as part of a richer requirement, keep only the richer item. "
+        "Keep each item short and concrete. "
         "notes: concise leftover job details only, such as contract type, work mode, schedule, benefits, recruitment steps; "
         "do not dump long page text. "
         "company_description: 1-2 short factual sentences about the employer only; do not include job-description text, "
@@ -368,6 +444,77 @@ def _normalize_requirements(values: list[Any]) -> list[str]:
         seen.add(key)
         normalized.append(cleaned)
     return normalized
+
+
+def _should_retry_detail(detail: JobDetail) -> bool:
+    final_url = (detail.final_url or "").lower()
+    content_chars = int(detail.raw.get("content_chars") or 0)
+    has_company = bool(_normalize_missing_marker(detail.company))
+    has_position = bool(_normalize_missing_marker(detail.position))
+    has_requirements = bool(detail.requirements)
+    suspicious_path = any(
+        marker in final_url
+        for marker in ("/login", "signin", "authorize", "callback", "account", "privacy", "policy", "legal", "consent")
+    )
+    if suspicious_path:
+        return True
+    if (not has_company or not has_position) and not has_requirements:
+        return True
+    if content_chars and content_chars < MIN_PRIMARY_CONTENT_CHARS and not has_requirements:
+        return True
+    return False
+
+
+def _detail_score(detail: JobDetail) -> int:
+    score = 0
+    for value in (detail.company, detail.position, detail.salary, detail.location, detail.notes, detail.company_description):
+        if _normalize_missing_marker(value):
+            score += 1
+    score += len(detail.requirements)
+    final_url = (detail.final_url or "").lower()
+    if any(marker in final_url for marker in ("/login", "signin", "authorize", "callback", "account", "privacy", "policy", "legal", "consent")):
+        score -= 5
+    if detail.raw.get("page_error"):
+        score -= 5
+    return score
+
+
+def _content_signature(content: PageContentSnapshot) -> str:
+    primary_text = _signature_text(content.content_text or content.fallback_text, limit=SIGNATURE_TEXT_CHARS)
+    title_text = _signature_text(content.page_title, limit=SIGNATURE_TITLE_CHARS)
+    meta_text = _signature_text(content.meta_description, limit=SIGNATURE_META_CHARS)
+    payload = "\n".join((primary_text, title_text, meta_text))
+    return hashlib.sha1(payload.encode("utf-8")).hexdigest()
+
+
+def _signature_text(value: str, *, limit: int) -> str:
+    cleaned = _clean(value)
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\s+", " ", cleaned)
+    for pattern in VOLATILE_SIGNATURE_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()[:limit]
+
+
+def _store_detail_cache(detail: JobDetail) -> None:
+    signature = str(detail.raw.get("content_signature") or "").strip()
+    cache_key = normalize_page_url(detail.final_url or detail.discovered_url)
+    if not signature or not cache_key or detail.raw.get("page_error") or _should_retry_detail(detail):
+        return
+    get_detail_cache().set(
+        cache_key,
+        signature,
+        {
+            "company": detail.company,
+            "position": detail.position,
+            "salary": detail.salary,
+            "location": detail.location,
+            "notes": detail.notes,
+            "requirements": list(detail.requirements),
+            "company_description": detail.company_description,
+        },
+    )
 
 
 def _should_broaden_extraction(content: PageContentSnapshot, payload: dict[str, Any]) -> bool:

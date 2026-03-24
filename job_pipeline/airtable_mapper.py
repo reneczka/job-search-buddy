@@ -8,6 +8,16 @@ from jobscraper.src.airtable_client import normalize_url as normalize_link
 
 from .models import JobDetail
 
+SUSPICIOUS_COMPANY_VALUES = {
+    "n/a",
+    "company",
+    "employer",
+    "o firmie",
+    "apply",
+    "aplikuj",
+    "polityka prywatności",
+    "privacy policy",
+}
 MISSING_VALUE_MARKERS = {
     "",
     "n/a",
@@ -40,6 +50,94 @@ COMPANY_DESCRIPTION_NOISE_PATTERNS = (
     r"pełny opis stanowiska.*",
     r"świadczenia na podstawie pełnego opisu stanowiska.*",
 )
+CHROME_MARKERS = (
+    "utwórz konto indeed",
+    "aplikacja w witrynie firmy",
+    "pełny opis stanowiska",
+    "na podstawie pełnego opisu stanowiska",
+    "przejdź od razu do głównej zawartości",
+)
+LOCATION_LABEL_PATTERNS = (
+    r"(?i)\bmiejsce pracy\b\s*:\s*",
+    r"(?i)\bworkplace\b\s*:\s*",
+    r"(?i)\blokalizacja\b\s*:\s*",
+)
+NON_CITY_LOCATION_MARKERS = {
+    "hybrydowo",
+    "hybrid",
+    "remote",
+    "praca zdalna",
+    "remote work",
+    "stacjonarnie",
+    "stacjonarna",
+    "on-site",
+    "on site",
+    "office",
+    "poland",
+    "polska",
+    "cała polska",
+    "cala polska",
+}
+WORK_MODE_PATTERNS = (
+    ("Remote", ("remote", "praca zdalna", "zdalna", "remote work")),
+    ("Hybrid", ("hybrid", "hybryd", "partially remote")),
+    ("On-site", ("on-site", "on site", "stacjon", "office")),
+)
+SALARY_LABEL_PATTERNS = (
+    r"(?i)^wynagrodzenie\s*[-:]\s*",
+    r"(?i)^salary\s*[-:]\s*",
+    r"(?i)^compensation\s*[-:]\s*",
+)
+REQUIREMENT_DUTY_PREFIXES = (
+    "developing ",
+    "building ",
+    "creating ",
+    "designing ",
+    "supporting ",
+    "maintaining ",
+    "implementing ",
+)
+SKILL_PREFIX_PATTERNS = (
+    r"(?i)^(basic|good|strong|practical)?\s*knowledge of\s+",
+    r"(?i)^familiarity with\s+",
+    r"(?i)^experience with\s+",
+    r"(?i)^experience in\s+",
+    r"(?i)^proficiency in\s+",
+    r"(?i)^understanding of\s+",
+    r"(?i)^programming skills in\s+",
+    r"(?i)^podstawowa znajomość\s+",
+    r"(?i)^dobra znajomość\s+",
+    r"(?i)^znajomość\s+",
+    r"(?i)^strong foundations in\s+",
+)
+LIST_PREFIX_MARKERS = (
+    "libraries",
+    "library",
+    "biblioteki",
+    "frameworks",
+    "framework",
+    "technologies",
+    "technology",
+    "technologie",
+    "tools",
+    "tooling",
+    "narzędzia",
+    "skills",
+    "skill",
+    "stack",
+    "tech stack",
+    "languages",
+    "języki",
+    "databases",
+    "bazy danych",
+    "following",
+    "takie jak",
+)
+SHORT_REQUIREMENT_CONNECTOR_PATTERNS = (
+    r"\s+and/or\s+",
+    r"\s+i/lub\s+",
+    r"\s+oraz\s+",
+)
 
 
 def to_airtable_record(detail: JobDetail) -> dict[str, str]:
@@ -71,6 +169,34 @@ def dedupe_airtable_records(records: list[dict[str, str]]) -> list[dict[str, str
         seen.add(normalized)
         deduped.append(record)
     return deduped
+
+
+def validate_airtable_record(record: dict[str, str]) -> list[str]:
+    issues: list[str] = []
+    link = _normalize_scalar(record.get("Link", ""))
+    company = _normalize_scalar(record.get("Company", ""))
+    position = _normalize_scalar(record.get("Position", ""))
+    requirements = _normalize_scalar(record.get("Requirements", ""))
+    notes = _normalize_scalar(record.get("Notes", ""))
+    description = _normalize_scalar(record.get("Company description", ""))
+
+    if not _looks_like_valid_job_link(link):
+        issues.append("blocking: invalid job link")
+    if not company or company.lower() in SUSPICIOUS_COMPANY_VALUES:
+        issues.append("blocking: missing or suspicious company")
+    if not position or position.lower() in {"praca", "job", "offer"}:
+        issues.append("blocking: missing or suspicious position")
+    if description and any(marker in description.lower() for marker in CHROME_MARKERS):
+        issues.append("warning: company description contains platform chrome")
+    if requirements and _looks_like_bundled_requirements(requirements):
+        issues.append("warning: requirements contain bundled items")
+    if notes and len(notes) > 420:
+        issues.append("warning: notes are too long")
+    return issues
+
+
+def should_skip_airtable_record(record: dict[str, str]) -> bool:
+    return any(issue.startswith("blocking:") for issue in validate_airtable_record(record))
 
 
 def _value(value: str) -> str:
@@ -108,6 +234,16 @@ def _normalize_scalar(value: str) -> str:
     return "" if cleaned.lower() in MISSING_VALUE_MARKERS else cleaned
 
 
+def _looks_like_valid_job_link(value: str) -> bool:
+    parsed = urlparse(value)
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    if not parsed.netloc:
+        return False
+    path = parsed.path.rstrip("/")
+    return path not in {"", "/", "/pl", "/en"}
+
+
 def _normalize_company(value: str) -> str:
     return _normalize_scalar(value)
 
@@ -124,6 +260,10 @@ def _normalize_salary(value: str) -> str:
         return ""
     if cleaned.lower() in MISSING_VALUE_MARKERS:
         return ""
+    for pattern in SALARY_LABEL_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned)
+    cleaned = re.sub(r"\s*;\s*", "; ", cleaned)
+    cleaned = re.sub(r"\s{2,}", " ", cleaned).strip(" -;")
     return cleaned
 
 
@@ -131,24 +271,123 @@ def _normalize_location(value: str) -> str:
     cleaned = _normalize_scalar(value)
     if not cleaned:
         return ""
-    cleaned = re.sub(r"\s*;\s*", "; ", cleaned)
-    cleaned = re.sub(r"\s*,\s*", ", ", cleaned)
-    return cleaned.strip(" ;,")
+    for pattern in LOCATION_LABEL_PATTERNS:
+        cleaned = re.sub(pattern, "", cleaned)
+
+    candidates: list[str] = []
+    for segment in re.split(r"[;/|]", cleaned):
+        candidate = _extract_city_candidate(segment)
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+    if not candidates:
+        mode = _extract_work_mode(cleaned)
+        return mode
+    return ", ".join(candidates)
 
 
 def _normalize_requirements(values: list[str]) -> list[str]:
     normalized: list[str] = []
-    seen: set[str] = set()
     for value in values:
-        item = _normalize_requirement_item(value)
-        if not item:
-            continue
-        key = _canonical_requirement(item)
-        if key in seen:
-            continue
-        seen.add(key)
-        normalized.append(item)
-    return normalized
+        for item in _expand_requirement_item(value):
+            normalized_item = _normalize_requirement_item(item)
+            if not normalized_item:
+                continue
+            normalized.append(normalized_item)
+    return _drop_redundant_requirements(normalized)
+
+
+def _expand_requirement_item(value: str) -> list[str]:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return []
+    match = re.match(r"(?i)^(located|based)\s+in\s+(.+)$", cleaned)
+    if match:
+        prefix = match.group(1).capitalize() + " in"
+        locations_part = match.group(2).strip()
+        if any(separator in locations_part for separator in ("/", ";", ",")):
+            pieces = [
+                piece.strip(" .")
+                for piece in re.split(r"[/;,]", locations_part)
+                if piece.strip(" .")
+            ]
+            if len(pieces) > 1:
+                return [f"{prefix} {piece}" for piece in pieces]
+        return [cleaned]
+
+    colon_expanded = _expand_colon_requirement_list(cleaned)
+    if colon_expanded:
+        return colon_expanded
+
+    short_list_expanded = _expand_short_requirement_list(cleaned)
+    if short_list_expanded:
+        return short_list_expanded
+
+    return [cleaned]
+
+
+def _expand_colon_requirement_list(value: str) -> list[str]:
+    if ":" not in value:
+        return []
+    prefix, tail = value.split(":", 1)
+    if not prefix.strip() or not tail.strip():
+        return []
+    if not any(marker in prefix.lower() for marker in LIST_PREFIX_MARKERS):
+        return []
+    parts = _split_short_requirement_parts(tail)
+    return parts if len(parts) > 1 else []
+
+
+def _expand_short_requirement_list(value: str) -> list[str]:
+    if "(" in value or ")" in value:
+        return []
+    if len(value) > 90:
+        return []
+    if not any(token in value for token in (" / ", ",", ";")) and not re.search(
+        r"\b(?:and/or|i/lub|oraz)\b",
+        value,
+        flags=re.IGNORECASE,
+    ):
+        return []
+    parts = _split_short_requirement_parts(value)
+    if len(parts) <= 1:
+        return []
+    if len(parts[0].split()) > 2:
+        return []
+    if sum(len(part.split()) for part in parts) > 10:
+        return []
+    return parts
+
+
+def _split_short_requirement_parts(value: str) -> list[str]:
+    normalized = value
+    for pattern in SHORT_REQUIREMENT_CONNECTOR_PATTERNS:
+        normalized = re.sub(pattern, ",", normalized, flags=re.IGNORECASE)
+    normalized = normalized.replace(" / ", ",")
+    parts = [
+        part.strip(" .")
+        for part in re.split(r"[;,]", normalized)
+        if part.strip(" .")
+    ]
+    if len(parts) <= 1 or len(parts) > 8:
+        return []
+    if not all(_is_short_requirement_part(part) for part in parts):
+        return []
+    return parts
+
+
+def _is_short_requirement_part(value: str) -> bool:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return False
+    cleaned = re.sub(r"^(?:or|and|oraz)\s+", "", cleaned, flags=re.IGNORECASE)
+    word_count = len(cleaned.split())
+    if word_count == 0 or word_count > 4:
+        return False
+    if len(cleaned) > 36:
+        return False
+    if re.search(r"[.!?]$", cleaned):
+        return False
+    return True
 
 
 def _normalize_requirement_item(value: str) -> str:
@@ -158,6 +397,8 @@ def _normalize_requirement_item(value: str) -> str:
     cleaned = re.sub(r"^[\-\*\u2022]+\s*", "", cleaned).strip()
     cleaned = re.sub(r"^(optional|must have|nice to have|technical skills|soft skills)\s*:\s*", "", cleaned, flags=re.IGNORECASE)
     if cleaned.lower() in REQUIREMENT_SECTION_LABELS:
+        return ""
+    if cleaned.lower().startswith(REQUIREMENT_DUTY_PREFIXES):
         return ""
     cleaned = re.sub(r"\s+", " ", cleaned).strip(" -;:")
     return cleaned
@@ -197,6 +438,112 @@ def _normalize_company_description(value: str) -> str:
     return _truncate_text(cleaned, max_chars=380, max_sentences=2)
 
 
+def _drop_redundant_requirements(values: list[str]) -> list[str]:
+    deduped: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        key = _canonical_requirement(value)
+        if key in seen:
+            continue
+        seen.add(key)
+        deduped.append(value)
+
+    filtered: list[str] = []
+    signatures = [_requirement_skill_signature(value) for value in deduped]
+    for index, value in enumerate(deduped):
+        signature = signatures[index]
+        if signature and any(
+            other_index != index
+            and signatures[other_index] == signature
+            and len(deduped[other_index]) > len(value)
+            for other_index in range(len(deduped))
+        ):
+            continue
+        if signature and any(
+            other_index != index
+            and signatures[other_index] != signature
+            and _requirement_contains_signature(deduped[other_index], signature)
+            for other_index in range(len(deduped))
+        ):
+            continue
+        filtered.append(value)
+    return filtered
+
+
+def _requirement_skill_signature(value: str) -> str:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower().strip(" .")
+    for pattern in SKILL_PREFIX_PATTERNS:
+        lowered = re.sub(pattern, "", lowered)
+    lowered = re.sub(r"\([^)]*\)", "", lowered)
+    lowered = lowered.strip(" .")
+    if ":" in lowered and len(lowered.split()) <= 4:
+        lowered = lowered.split(":", 1)[0].strip()
+    if len(lowered.split()) > 3 or len(lowered) > 30:
+        return ""
+    return _canonical_requirement(lowered)
+
+
+def _requirement_contains_signature(value: str, signature: str) -> bool:
+    if not signature:
+        return False
+    normalized = _canonical_requirement(value)
+    return normalized != signature and f" {signature} " in f" {normalized} "
+
+
+def _extract_city_candidate(value: str) -> str:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\([^)]*\)", lambda match: match.group(0).replace(",", ";"), cleaned)
+    cleaned = re.sub(r"[()]", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;")
+    if not cleaned:
+        return ""
+
+    parts = [part.strip(" ,;") for part in re.split(r"[;,]", cleaned) if part.strip(" ,;")]
+    if not parts:
+        return ""
+
+    ordered_parts = parts if not any(char.isdigit() for char in parts[0]) else list(reversed(parts))
+    for part in ordered_parts:
+        city = _clean_location_part(part)
+        if city:
+            return city
+    return ""
+
+
+def _extract_work_mode(value: str) -> str:
+    lowered = _normalize_scalar(value).lower()
+    if not lowered:
+        return ""
+    for label, markers in WORK_MODE_PATTERNS:
+        if any(marker in lowered for marker in markers):
+            return label
+    return ""
+
+
+def _clean_location_part(value: str) -> str:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return ""
+    cleaned = re.sub(r"\b\d{2}-\d{3}\b", "", cleaned)
+    cleaned = re.sub(r"\b\d+[A-Za-z]?\b", "", cleaned)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip(" ,;-")
+    if not cleaned:
+        return ""
+    lowered = cleaned.lower()
+    if lowered in NON_CITY_LOCATION_MARKERS:
+        return ""
+    if any(marker in lowered for marker in ("remote", "hybrid", "zdal", "stacjon", "office")):
+        return ""
+    if lowered.endswith(("skie", "ckie", "dzkie")) and cleaned == cleaned.lower():
+        return ""
+    return cleaned
+
+
 def _truncate_text(value: str, max_chars: int, max_sentences: int) -> str:
     cleaned = _normalize_scalar(value)
     if not cleaned:
@@ -213,3 +560,24 @@ def _truncate_text(value: str, max_chars: int, max_sentences: int) -> str:
     if last_separator >= max_chars // 2:
         shortened = shortened[:last_separator].rstrip(" ,;:-")
     return shortened
+
+
+def _looks_like_bundled_requirements(value: str) -> bool:
+    bullets = [line.strip()[2:] for line in value.splitlines() if line.strip().startswith("- ")]
+    for bullet in bullets:
+        if len(bullet) < 40:
+            continue
+        if ";" in bullet:
+            return True
+        if " / " in bullet:
+            slash_parts = [part.strip() for part in bullet.split(" / ") if part.strip()]
+            if len(slash_parts) >= 2 and all(len(part.split()) <= 2 for part in slash_parts):
+                return True
+        comma_parts = [part.strip() for part in bullet.split(",") if part.strip()]
+        if len(comma_parts) < 3:
+            continue
+        first_part_words = len(comma_parts[0].split())
+        short_tail_parts = sum(1 for part in comma_parts[1:] if len(part.split()) <= 2)
+        if first_part_words <= 2 and short_tail_parts == len(comma_parts) - 1:
+            return True
+    return False
