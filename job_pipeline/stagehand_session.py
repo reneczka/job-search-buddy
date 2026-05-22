@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import subprocess
 import time
+from pathlib import Path
 from typing import Any, Optional
 
 import httpx
@@ -55,6 +57,49 @@ def scoped_model_options(model_opts: dict[str, Any], selector: Optional[str]) ->
 
 async def sleep_ms(ms: int) -> None:
     await asyncio.sleep(ms / 1000)
+
+
+def load_storage_state_payload(session_state_path: Optional[Path]) -> Optional[dict[str, Any]]:
+    if not session_state_path or not session_state_path.exists():
+        return None
+    try:
+        payload = json.loads(session_state_path.read_text(encoding="utf-8"))
+    except Exception:
+        return None
+    return payload if isinstance(payload, dict) else None
+
+
+async def apply_storage_state_to_context(context: BrowserContext, payload: Optional[dict[str, Any]]) -> None:
+    if not payload:
+        return
+
+    cookies = payload.get("cookies")
+    if isinstance(cookies, list) and cookies:
+        try:
+            await context.add_cookies(cookies)
+        except Exception:
+            pass
+
+    origins = payload.get("origins")
+    if isinstance(origins, list) and origins:
+        try:
+            await context.add_init_script(
+                """(origins) => {
+                    const current = window.location.origin;
+                    const match = origins.find((item) => item && item.origin === current);
+                    if (!match || !Array.isArray(match.localStorage)) return;
+                    for (const entry of match.localStorage) {
+                      if (!entry || typeof entry.name !== "string") continue;
+                      try {
+                        window.localStorage.setItem(entry.name, String(entry.value ?? ""));
+                      } catch (error) {
+                      }
+                    }
+                }""",
+                origins,
+            )
+        except Exception:
+            pass
 
 
 def cleanup_browser_processes() -> None:
@@ -288,6 +333,7 @@ class StagehandRuntime:
         browser: Browser,
         context: BrowserContext,
         page: Page,
+        session_state_path: Optional[Path],
         model_name: str,
         model_api_key: Optional[str],
         browserbase_api_key: Optional[str],
@@ -305,6 +351,7 @@ class StagehandRuntime:
         self.browser = browser
         self.context = context
         self.page = page
+        self.session_state_path = session_state_path
         self.model_name = model_name
         self.model_api_key = model_api_key
         self.browserbase_api_key = browserbase_api_key
@@ -354,6 +401,7 @@ class StagehandRuntime:
             local_headless=self.local_headless,
             browserbase_api_key=self.browserbase_api_key,
             browserbase_project_id=self.browserbase_project_id,
+            session_state_path=self.session_state_path,
         )
         self.client = stack["client"]
         self.raw_session = stack["raw_session"]
@@ -362,6 +410,15 @@ class StagehandRuntime:
         self.browser = stack["browser"]
         self.context = stack["context"]
         self.page = stack["page"]
+
+    async def save_storage_state(self) -> None:
+        if not self.session_state_path:
+            return
+        try:
+            self.session_state_path.parent.mkdir(parents=True, exist_ok=True)
+            await self.context.storage_state(path=str(self.session_state_path))
+        except Exception:
+            pass
 
     async def _context_pages(self) -> list[Page]:
         try:
@@ -416,6 +473,7 @@ class StagehandRuntime:
             pass
 
     async def _close_current_stack(self, end_session: bool) -> None:
+        await self.save_storage_state()
         await self.__class__._close_stack_resources(
             session=self.session,
             browser=self.browser,
@@ -425,7 +483,7 @@ class StagehandRuntime:
         )
 
     @classmethod
-    async def create(cls) -> "StagehandRuntime":
+    async def create(cls, *, session_state_path: Optional[str] = None) -> "StagehandRuntime":
         load_dotenv()
 
         model_name = env_str("MODEL")
@@ -442,6 +500,8 @@ class StagehandRuntime:
         browserbase_api_key = env_str("BROWSERBASE_API_KEY") or None
         browserbase_project_id = env_str("BROWSERBASE_PROJECT_ID") or None
 
+        resolved_session_state_path = Path(session_state_path).expanduser().resolve() if session_state_path else None
+
         stack = await cls._start_runtime_stack(
             model_name=model_name,
             model_api_key=model_api_key,
@@ -451,6 +511,7 @@ class StagehandRuntime:
             local_headless=local_headless,
             browserbase_api_key=browserbase_api_key,
             browserbase_project_id=browserbase_project_id,
+            session_state_path=resolved_session_state_path,
         )
 
         return cls(
@@ -461,6 +522,7 @@ class StagehandRuntime:
             browser=stack["browser"],
             context=stack["context"],
             page=stack["page"],
+            session_state_path=resolved_session_state_path,
             model_name=model_name,
             model_api_key=model_api_key,
             browserbase_api_key=browserbase_api_key,
@@ -484,6 +546,7 @@ class StagehandRuntime:
         local_headless: bool,
         browserbase_api_key: Optional[str],
         browserbase_project_id: Optional[str],
+        session_state_path: Optional[Path],
     ) -> dict[str, Any]:
         del cache_enabled
 
@@ -521,7 +584,8 @@ class StagehandRuntime:
         session = LoggedStagehandSession(raw_session, enable_logs=True)
         playwright = await async_playwright().start()
         browser = await playwright.chromium.connect_over_cdp(raw_session.data.cdp_url)
-        context: BrowserContext = browser.contexts[0] if browser.contexts else await browser.new_context()
+        context = browser.contexts[0] if browser.contexts else await browser.new_context()
+        await apply_storage_state_to_context(context, load_storage_state_payload(session_state_path))
         page: Page = context.pages[0] if context.pages else await context.new_page()
         return {
             "client": client,

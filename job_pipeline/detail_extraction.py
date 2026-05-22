@@ -19,7 +19,7 @@ console = Console()
 MIN_PRIMARY_CONTENT_CHARS = 450
 MAX_FALLBACK_TEXT_CHARS = 12000
 MAX_MAIN_TEXT_CHARS = 10000
-DETAIL_CACHE_VERSION = "v5"
+DETAIL_CACHE_VERSION = "v6"
 SIGNATURE_TEXT_CHARS = 2500
 SIGNATURE_META_CHARS = 300
 SIGNATURE_TITLE_CHARS = 200
@@ -141,6 +141,10 @@ async def _extract_job_detail_once(
     raw_requirements = payload.get("requirements")
     if isinstance(raw_requirements, list):
         requirements = _normalize_requirements(raw_requirements)
+    if not requirements:
+        fallback_requirements = fallback.get("requirements")
+        if isinstance(fallback_requirements, list):
+            requirements = _normalize_requirements(fallback_requirements)
 
     return JobDetail(
         source=source_name,
@@ -238,12 +242,75 @@ async def _extract_payload(runtime: StagehandRuntime, content: PageContentSnapsh
     return result, used_broad_fallback
 
 
-async def _fallback_page_data(page: Any, content: PageContentSnapshot) -> dict[str, str]:
+async def _fallback_page_data(page: Any, content: PageContentSnapshot) -> dict[str, Any]:
     try:
         payload = await page.evaluate(
             """() => {
                 const text = (el) => (el?.textContent || "").trim();
                 const meta = (name) => document.querySelector(`meta[name="${name}"], meta[property="${name}"]`)?.content || "";
+                const normalize = (value) => (value || "").replace(/\u00a0/g, " ").replace(/\s+/g, " ").trim();
+                const root = document.querySelector("main, article, [role='main']") || document.body;
+                const requirementPatterns = [
+                  /requirements?/i,
+                  /qualifications?/i,
+                  /what you(?:'|’)ll need/i,
+                  /what we(?:'|’)re looking for/i,
+                  /must have/i,
+                  /nice to have/i,
+                  /od kandydatów/i,
+                  /oczekujemy/i,
+                  /poszukiwane kompetencje/i,
+                  /wymagania/i,
+                  /mile widziane/i,
+                  /atutami będą/i,
+                ];
+                const stopPatterns = [
+                  /responsibilit/i,
+                  /duties/i,
+                  /what you(?:'|’)ll do/i,
+                  /zakres obowiązków/i,
+                  /oferujemy/i,
+                  /benefits?/i,
+                  /świadczenia/i,
+                ];
+                const collectPreviousLabel = (node) => {
+                  let current = node;
+                  while (current && current !== root) {
+                    let sibling = current.previousSibling;
+                    while (sibling) {
+                      if (sibling.nodeType === Node.TEXT_NODE) {
+                        const raw = normalize(sibling.textContent || "");
+                        if (raw && raw.length <= 120) {
+                          return raw;
+                        }
+                      } else if (sibling.nodeType === Node.ELEMENT_NODE) {
+                        const raw = normalize(sibling.innerText || sibling.textContent || "");
+                        if (raw && raw.length <= 120) {
+                          return raw;
+                        }
+                      }
+                      sibling = sibling.previousSibling;
+                    }
+                    current = current.parentElement;
+                  }
+                  return "";
+                };
+                const requirementItems = [];
+                const seen = new Set();
+                for (const list of root.querySelectorAll("ul, ol")) {
+                  const label = collectPreviousLabel(list);
+                  if (!label) continue;
+                  if (stopPatterns.some((pattern) => pattern.test(label))) continue;
+                  if (!requirementPatterns.some((pattern) => pattern.test(label))) continue;
+                  for (const item of list.querySelectorAll(":scope > li")) {
+                    const raw = normalize(item.innerText || item.textContent || "");
+                    if (!raw || raw.length < 2 || raw.length > 280) continue;
+                    const key = raw.toLowerCase();
+                    if (seen.has(key)) continue;
+                    seen.add(key);
+                    requirementItems.push(raw);
+                  }
+                }
                 const h1 = text(document.querySelector("h1"));
                 const title = document.title || "";
                 const subtitle = text(document.querySelector("h2, [class*='company'], [data-testid*='company']"));
@@ -257,6 +324,7 @@ async def _fallback_page_data(page: Any, content: PageContentSnapshot) -> dict[s
                   location: "",
                   notes: meta("description") || paragraphs[0] || "",
                   company_description: paragraphs.slice(0, 2).join(" "),
+                  requirements: requirementItems,
                 };
             }"""
         )
@@ -282,6 +350,7 @@ async def _fallback_page_data(page: Any, content: PageContentSnapshot) -> dict[s
         "location": _clean(parsed.get("location")),
         "notes": notes,
         "company_description": company_description,
+        "requirements": parsed.get("requirements") if isinstance(parsed.get("requirements"), list) else [],
     }
 
 

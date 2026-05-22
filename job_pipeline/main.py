@@ -11,7 +11,6 @@ from .pipeline import run_pipeline
 
 
 console = Console()
-DEFAULT_MAX_JOBS_TOTAL = 3
 
 
 def parse_args() -> argparse.Namespace:
@@ -51,8 +50,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-jobs-total",
         type=int,
-        default=DEFAULT_MAX_JOBS_TOTAL,
-        help="Limit the whole run to the first N extracted jobs across all boards (default: 3).",
+        default=None,
+        help="Limit the whole run to the first N extracted jobs across all boards.",
     )
     return parser.parse_args()
 

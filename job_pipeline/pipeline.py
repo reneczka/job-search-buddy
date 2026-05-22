@@ -36,7 +36,7 @@ async def run_pipeline(
     write_airtable_indeed_url_test: bool = False,
     write_airtable_indeed_full: bool = False,
     max_jobs_per_board: int | None = None,
-    max_jobs_total: int | None = 3,
+    max_jobs_total: int | None = None,
 ) -> PipelineRunResult:
     load_dotenv()
     boards = selected_boards(site)

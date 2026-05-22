@@ -1,0 +1,18 @@
+{
+  "full_name": "Jane Doe",
+  "email": "jane.doe@example.com",
+  "phone": "+48 555 555 555",
+  "location_city": "Warszawa",
+  "country": "Poland",
+  "linkedin_url": "https://www.linkedin.com/in/janedoe",
+  "github_url": "https://github.com/janedoe",
+  "portfolio_url": "https://janedoe.dev",
+  "canonical_cv_path": "resume.pdf",
+  "common_answers": {
+    "work_authorization": "Yes",
+    "requires_sponsorship": "No",
+    "relocation": "No",
+    "salary_expectation": "5000 PLN",
+    "notice_period": "Immediate"
+  }
+}

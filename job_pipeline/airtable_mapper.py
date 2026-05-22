@@ -167,25 +167,40 @@ ADDRESS_HINT_PATTERNS = (
 
 def to_airtable_record(detail: JobDetail) -> dict[str, str]:
     company = _normalize_company(detail.company)
+    position = _normalize_position(detail.position)
     salary = _normalize_salary(detail.salary)
+    work_mode = _normalize_work_mode(
+        detail.location,
+        detail.notes,
+        detail.company_description,
+    )
     location = _normalize_location(
         detail.location,
         fallback_text="; ".join(part for part in (detail.notes, detail.company_description) if _normalize_scalar(part)),
     )
-    requirements = _normalize_requirements(detail.requirements)
-    notes = _normalize_notes(detail.notes, company=company)
+    requirements = _normalize_requirements(detail.requirements, notes=detail.notes)
+    notes = _normalize_notes(
+        detail.notes,
+        company=company,
+        position=position,
+        salary=salary,
+        location=location,
+        work_mode=work_mode,
+        requirements=requirements,
+    )
     company_description = _normalize_company_description(
         detail.company_description,
         company=company,
-        position=_normalize_position(detail.position),
+        position=position,
     )
     return {
         "Source": _value(detail.source),
         "Link": _value(detail.final_url or detail.discovered_url),
         "Company": _value(company),
-        "Position": _value(_normalize_position(detail.position)),
+        "Position": _value(position),
         "Salary": _value(salary),
         "Location": _value(location),
+        "Local/Remote/Hybrid": _value(work_mode),
         "Notes": _value(notes),
         "Requirements": _value(_requirements_value(requirements)),
         "Company description": _value(company_description),
@@ -321,7 +336,14 @@ def _normalize_location(value: str, fallback_text: str = "") -> str:
     return ", ".join(candidates)
 
 
-def _normalize_requirements(values: list[str]) -> list[str]:
+def _normalize_work_mode(*values: str) -> str:
+    mode = _choose_work_mode(*values)
+    if mode == "On-site":
+        return "Local"
+    return mode
+
+
+def _normalize_requirements(values: list[str], notes: str = "") -> list[str]:
     normalized: list[str] = []
     for value in values:
         for item in _expand_requirement_item(value):
@@ -329,8 +351,84 @@ def _normalize_requirements(values: list[str]) -> list[str]:
             if not normalized_item:
                 continue
             normalized.append(normalized_item)
+    for value in _recover_requirements_from_notes(notes):
+        for item in _expand_requirement_item(value):
+            normalized_item = _normalize_requirement_item(item)
+            if not normalized_item:
+                continue
+            normalized.append(normalized_item)
     normalized = _compact_repeated_prefix_requirements(normalized)
     return _drop_redundant_requirements(normalized)
+
+
+def _recover_requirements_from_notes(notes: str) -> list[str]:
+    cleaned = _normalize_scalar(notes)
+    if not cleaned:
+        return []
+
+    parts = [_normalize_scalar(part) for part in re.split(r"[;\n\r]+", cleaned) if _normalize_scalar(part)]
+    recovered: list[str] = []
+    collecting_stack = False
+
+    for part in parts:
+        stack_payload = _strip_stack_label(part)
+        if stack_payload is not None:
+            collecting_stack = True
+            recovered.extend(_split_stack_segment(stack_payload))
+            continue
+
+        if collecting_stack and _looks_like_stack_segment(part):
+            recovered.extend(_split_stack_segment(part))
+            continue
+
+        collecting_stack = False
+
+    return recovered
+
+
+def _strip_stack_label(value: str) -> str | None:
+    match = re.match(
+        r"(?i)^(?:tech stack(?:s| highlights?)?|technologies expected|technologies used|technologies|stack)\s*:\s*(.+)$",
+        value,
+    )
+    if not match:
+        return None
+    return match.group(1).strip()
+
+
+def _looks_like_stack_segment(value: str) -> bool:
+    cleaned = _normalize_scalar(value)
+    if not cleaned or ":" in cleaned:
+        return False
+    if "/" not in cleaned and "," not in cleaned:
+        return False
+    parts = _split_stack_segment(cleaned)
+    return 1 < len(parts) <= 12
+
+
+def _split_stack_segment(value: str) -> list[str]:
+    normalized = _normalize_scalar(value)
+    if not normalized:
+        return []
+    normalized = re.sub(r"(?i)\btechnologies?\b", "", normalized)
+    normalized = re.sub(r"(?i)\bci\s*/\s*cd\b", "CI_CD", normalized)
+    normalized = normalized.replace("/", ",")
+    parts = [
+        part.strip(" .")
+        for part in re.split(r"[;,]", normalized)
+        if part.strip(" .")
+    ]
+
+    cleaned_parts: list[str] = []
+    for part in parts:
+        part = part.replace("CI_CD", "CI/CD")
+        if len(part.split()) > 4:
+            continue
+        if part.lower() in {"and", "or", "oraz", "i"}:
+            continue
+        if part not in cleaned_parts:
+            cleaned_parts.append(part)
+    return cleaned_parts
 
 
 def _expand_requirement_item(value: str) -> list[str]:
@@ -457,10 +555,17 @@ def _canonical_requirement(value: str) -> str:
     return re.sub(r"\s+", " ", cleaned).strip()
 
 
-def _normalize_notes(value: str, company: str = "") -> str:
+def _normalize_notes(
+    value: str,
+    company: str = "",
+    position: str = "",
+    salary: str = "",
+    location: str = "",
+    work_mode: str = "",
+    requirements: list[str] | None = None,
+) -> str:
     cleaned = _normalize_scalar(value)
-    if not cleaned:
-        return ""
+    requirements = requirements or []
     raw_parts = [_normalize_scalar(part) for part in re.split(r"[;\n\r]+", cleaned)]
     parts: list[str] = []
     for part in raw_parts:
@@ -472,10 +577,65 @@ def _normalize_notes(value: str, company: str = "") -> str:
         parts.append(normalized_part)
     compact = "; ".join(parts) if len(parts) > 1 else (parts[0] if parts else "")
     if not compact:
-        return ""
+        return _synthesize_notes(
+            position=position,
+            salary=salary,
+            location=location,
+            work_mode=work_mode,
+            requirements=requirements,
+        )
     compact = re.sub(r"\s*;\s*", "; ", compact)
     compact = re.sub(r"\s{2,}", " ", compact).strip(" ;")
-    return _truncate_text(compact, max_chars=420, max_sentences=3)
+    compact = _truncate_text(compact, max_chars=420, max_sentences=3)
+    if compact:
+        return compact
+    return _synthesize_notes(
+        position=position,
+        salary=salary,
+        location=location,
+        work_mode=work_mode,
+        requirements=requirements,
+    )
+
+
+def _synthesize_notes(
+    *,
+    position: str,
+    salary: str,
+    location: str,
+    work_mode: str,
+    requirements: list[str],
+) -> str:
+    parts: list[str] = []
+    if work_mode:
+        parts.append(f"Work mode: {work_mode}")
+    if location and location not in {work_mode, "Remote", "Hybrid", "Local"}:
+        parts.append(f"Location: {location}")
+    if salary:
+        parts.append(f"Salary: {salary}")
+    requirement_hint = _pick_note_requirement(requirements)
+    if requirement_hint:
+        parts.append(f"Key requirement: {requirement_hint}")
+    elif position:
+        parts.append(f"Role: {position}")
+    return "; ".join(parts[:4]).strip(" ;")
+
+
+def _pick_note_requirement(requirements: list[str]) -> str:
+    candidates = [_normalize_scalar(item) for item in requirements if _normalize_scalar(item)]
+    if not candidates:
+        return ""
+
+    def score(value: str) -> tuple[int, int]:
+        lowered = value.lower()
+        technical = bool(re.search(
+            r"\b(?:python|java(?:script)?|typescript|sql|html|css|aws|azure|gcp|docker|kubernetes|git|react|angular|django|flask|fastapi|node(?:\\.js)?|api|llm|rag|genai|tensorflow|pytorch|terraform|databricks|pyspark|go|golang|c\\+\\+|c#|php|bash|linux|excel|power bi)\b",
+            lowered,
+        ))
+        concise = 20 <= len(value) <= 120
+        return (2 if technical else 0) + (1 if concise else 0), -len(value)
+
+    return max(candidates, key=score)
 
 
 def _normalize_note_part(value: str) -> str:
@@ -659,12 +819,34 @@ def _extract_city_candidates(value: str) -> list[str]:
 
 
 def _extract_work_mode(value: str) -> str:
-    lowered = _normalize_scalar(value).lower()
-    if not lowered:
-        return ""
-    for label, markers in WORK_MODE_PATTERNS:
-        if any(marker in lowered for marker in markers):
-            return label
+    return _choose_work_mode(value)
+
+
+def _choose_work_mode(*values: str) -> str:
+    saw_remote = False
+    saw_hybrid = False
+    saw_on_site = False
+
+    for value in values:
+        lowered = _normalize_scalar(value).lower()
+        if not lowered:
+            continue
+        for label, markers in WORK_MODE_PATTERNS:
+            if not any(marker in lowered for marker in markers):
+                continue
+            if label == "Hybrid":
+                saw_hybrid = True
+            elif label == "Remote":
+                saw_remote = True
+            elif label == "On-site":
+                saw_on_site = True
+
+    if saw_hybrid or (saw_remote and saw_on_site):
+        return "Hybrid"
+    if saw_remote:
+        return "Remote"
+    if saw_on_site:
+        return "On-site"
     return ""
 
 

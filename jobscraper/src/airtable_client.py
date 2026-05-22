@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import os
+import re
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional
 from urllib.parse import urlparse, urlunparse
@@ -207,6 +209,11 @@ class AirtableClient:
         """Accept either raw field dicts or objects containing a `fields` key."""
         fields = record["fields"] if "fields" in record and isinstance(record["fields"], dict) else record
 
+        if isinstance(fields, dict):
+            notes = fields.get("Notes")
+            if "Notes" in fields and (notes is None or not str(notes).strip()):
+                fields["Notes"] = AirtableClient._synthesize_notes(fields)
+
         if isinstance(fields, dict) and "Requirements" in fields:
             requirements = fields.get("Requirements")
 
@@ -237,3 +244,61 @@ class AirtableClient:
                     fields.pop("Requirements", None)
 
         return fields
+
+    @staticmethod
+    def _synthesize_notes(fields: Dict[str, Any]) -> str:
+        parts: List[str] = []
+
+        work_mode = str(fields.get("Local/Remote/Hybrid") or "").strip()
+        if work_mode and work_mode != "N/A":
+            parts.append(f"Work mode: {work_mode}")
+
+        location = str(fields.get("Location") or "").strip()
+        if location and location not in {"N/A", work_mode}:
+            parts.append(f"Location: {location}")
+
+        salary = str(fields.get("Salary") or "").strip()
+        if salary and salary != "N/A":
+            parts.append(f"Salary: {salary}")
+
+        requirements = str(fields.get("Requirements") or "").strip()
+        if requirements and requirements != "N/A":
+            requirement_hint = AirtableClient._pick_note_requirement(requirements.splitlines())
+            if requirement_hint:
+                parts.append(f"Key requirement: {requirement_hint}")
+
+        position = str(fields.get("Position") or "").strip()
+        if not parts and position and position != "N/A":
+            parts.append(f"Role: {position}")
+
+        company = str(fields.get("Company") or "").strip()
+        if not parts and company and company != "N/A":
+            parts.append(f"Company: {company}")
+
+        return "; ".join(parts[:4]).strip(" ;")
+
+    @staticmethod
+    def _pick_note_requirement(requirements: List[str]) -> str:
+        candidates: List[str] = []
+        for item in requirements:
+            text = str(item).strip()
+            if not text:
+                continue
+            chunks = re.split(r"(?:\n|(?<=\S)\s+-\s+)", text)
+            for chunk in chunks:
+                cleaned = chunk.removeprefix("- ").strip()
+                if cleaned:
+                    candidates.append(cleaned)
+        if not candidates:
+            return ""
+
+        def score(value: str) -> tuple[int, int]:
+            lowered = value.lower()
+            technical = bool(re.search(
+                r"\b(?:python|java(?:script)?|typescript|sql|html|css|aws|azure|gcp|docker|kubernetes|git|react|angular|django|flask|fastapi|node(?:\\.js)?|api|llm|rag|genai|tensorflow|pytorch|terraform|databricks|pyspark|go|golang|c\\+\\+|c#|php|bash|linux|excel|power bi)\b",
+                lowered,
+            ))
+            concise = 20 <= len(value) <= 120
+            return (2 if technical else 0) + (1 if concise else 0), -len(value)
+
+        return max(candidates, key=score)
