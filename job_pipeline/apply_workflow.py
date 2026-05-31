@@ -2,7 +2,11 @@ from __future__ import annotations
 
 import os
 import re
+import signal
+import subprocess
 import sys
+import time
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from pathlib import Path
@@ -13,6 +17,7 @@ from dotenv import load_dotenv
 from requests import HTTPError
 from rich.console import Console
 from rich.panel import Panel
+from rich.table import Table
 
 from jobscraper.src.airtable_client import AirtableClient, AirtableConfig
 
@@ -50,12 +55,27 @@ TOUCHED_APPLICATION_STATUSES = {
     APPLICATION_STATUS_SKIPPED,
 }
 ELIGIBLE_RESET_STATUSES = {"", APPLICATION_STATUS_NEW, APPLICATION_STATUS_READY, APPLICATION_STATUS_APPROVED}
+APPROVABLE_APPLICATION_STATUSES = {
+    "",
+    APPLICATION_STATUS_NEW,
+    APPLICATION_STATUS_READY,
+    APPLICATION_STATUS_APPROVED,
+    APPLICATION_STATUS_IN_PROGRESS,
+    APPLICATION_STATUS_NEEDS_REVIEW,
+    APPLICATION_STATUS_FAILED,
+    APPLICATION_STATUS_SKIPPED,
+}
 APPLY_SUPPORTED_SOURCES = set(supported_site_names())
 DEFAULT_APPLY_THRESHOLD = 80
 DEFAULT_APPLY_BATCH_SIZE = 3
 DEFAULT_APPLY_SESSION_STATE_PATH = ".session_states/apply-session.json"
 DEFAULT_APPLY_RUN_LOCK_PATH = ".session_states/apply-run.lock"
 MAX_APPLY_FLOW_RECOVERY_ATTEMPTS = 3
+AUTOMATION_PROCESS_MARKERS = (
+    ("apply_run", "job_pipeline.apply_jobs"),
+    ("stagehand_browser", "stagehand-v3"),
+    ("playwright_browser", "ms-playwright"),
+)
 APPLICATION_FIELDS = [
     "Link",
     "Source",
@@ -133,6 +153,22 @@ SUBMIT_TEXT_MARKERS = (
     "finish application",
     "złóż aplikację",
 )
+APPLICATION_SUCCESS_TEXT_MARKERS = (
+    "dziękujemy",
+    "dziekujemy",
+    "thank you",
+    "podsumowanie aplikacji",
+    "application sent",
+    "aplikacja została wysłana",
+)
+APPLY_CLOSED_TEXT_MARKERS = (
+    "zakończył zbieranie zgłoszeń",
+    "zakonczył zbieranie zgłoszeń",
+    "aktualne oferty pracodawcy",
+    "no longer accepting applications",
+    "applications are closed",
+    "application period has ended",
+)
 CV_FIELD_MARKERS = ("cv", "resume", "résumé", "życiorys")
 COVER_LETTER_MARKERS = (
     "cover letter",
@@ -156,7 +192,7 @@ FIELD_PATTERNS = {
     ),
     "email": ("email", "e-mail", "mail"),
     "phone": ("phone", "telefon", "mobile"),
-    "location_city": ("city", "location", "miasto", "miejscowość"),
+    "location_city": ("city", "location", "miasto", "miejscowość", "adres", "zlokalizuj", "dokładny adres"),
     "linkedin_url": ("linkedin",),
     "github_url": ("github",),
     "portfolio_url": ("portfolio", "website", "strona"),
@@ -388,21 +424,200 @@ def _release_apply_run_lock(lock_path: Path | None) -> None:
             pass
 
 
+def _list_automation_processes() -> list[dict[str, Any]]:
+    try:
+        result = subprocess.run(
+            ["ps", "-Ao", "pid,command"],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except Exception:
+        return []
+
+    current_pid = os.getpid()
+    processes: list[dict[str, Any]] = []
+    for raw_line in result.stdout.splitlines():
+        line = raw_line.strip()
+        if not line or line.lower().startswith("pid "):
+            continue
+        pid_text, _, command = line.partition(" ")
+        try:
+            pid = int(pid_text)
+        except ValueError:
+            continue
+        if pid == current_pid:
+            continue
+        for kind, marker in AUTOMATION_PROCESS_MARKERS:
+            if marker in command:
+                processes.append({"pid": pid, "kind": kind, "command": command.strip()})
+                break
+    return sorted(processes, key=lambda item: int(item["pid"]))
+
+
+def _read_apply_run_lock_status(lock_path: str = DEFAULT_APPLY_RUN_LOCK_PATH) -> dict[str, Any]:
+    path = Path(lock_path).expanduser().resolve()
+    if not path.exists():
+        return {"path": str(path), "exists": False, "pid": None, "alive": False, "stale": False}
+
+    raw = path.read_text(encoding="utf-8").strip()
+    pid: int | None = None
+    if raw:
+        try:
+            pid = int(raw.splitlines()[0].strip())
+        except ValueError:
+            pid = None
+    alive = _pid_is_alive(pid or 0) if pid is not None else False
+    stale = bool(path.exists() and not alive)
+    return {"path": str(path), "exists": True, "pid": pid, "alive": alive, "stale": stale}
+
+
+def inspect_apply_environment(lock_path: str = DEFAULT_APPLY_RUN_LOCK_PATH) -> dict[str, Any]:
+    processes = _list_automation_processes()
+    lock = _read_apply_run_lock_status(lock_path)
+    safe_to_start = not processes and not lock["exists"]
+    return {"safe_to_start": safe_to_start, "processes": processes, "lock": lock}
+
+
+def assert_apply_environment_ready(lock_path: str = DEFAULT_APPLY_RUN_LOCK_PATH) -> None:
+    summary = inspect_apply_environment(lock_path)
+    problems: list[str] = []
+    if summary["processes"]:
+        problems.append(
+            "Found active automation processes: "
+            + ", ".join(f"{item['kind']} pid={item['pid']}" for item in summary["processes"])
+        )
+    lock = summary["lock"]
+    if lock["exists"]:
+        if lock["stale"]:
+            problems.append(f"Found stale apply lock at {lock['path']}. Run cleanup before starting a new apply run.")
+        else:
+            problems.append(f"Apply lock is still active at {lock['path']} (pid={lock['pid']}).")
+    if problems:
+        raise RuntimeError("Apply preflight failed. " + " ".join(problems))
+
+
+def print_apply_preflight_summary(summary: dict[str, Any]) -> None:
+    lock = summary["lock"]
+    status = "SAFE_TO_START=yes" if summary["safe_to_start"] else "SAFE_TO_START=no"
+    lines = [status]
+    if lock["exists"]:
+        lines.append(
+            "lock="
+            + (
+                f"active pid={lock['pid']} path={lock['path']}"
+                if lock["alive"]
+                else f"stale path={lock['path']}"
+            )
+        )
+    else:
+        lines.append("lock=none")
+    if summary["processes"]:
+        lines.append(f"automation_processes={len(summary['processes'])}")
+    else:
+        lines.append("automation_processes=0")
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="Apply Preflight",
+            style="green" if summary["safe_to_start"] else "yellow",
+        )
+    )
+    if not summary["processes"]:
+        return
+    table = Table(title="Automation Processes")
+    table.add_column("PID", style="cyan")
+    table.add_column("Kind", style="magenta")
+    table.add_column("Command", overflow="fold")
+    for process in summary["processes"]:
+        table.add_row(str(process["pid"]), str(process["kind"]), str(process["command"]))
+    console.print(table)
+
+
+def cleanup_apply_environment(lock_path: str = DEFAULT_APPLY_RUN_LOCK_PATH) -> dict[str, Any]:
+    before = inspect_apply_environment(lock_path)
+    terminated: list[int] = []
+    killed: list[int] = []
+
+    for process in before["processes"]:
+        pid = int(process["pid"])
+        try:
+            os.kill(pid, signal.SIGTERM)
+            terminated.append(pid)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+    if terminated:
+        time.sleep(0.4)
+
+    remaining = _list_automation_processes()
+    for process in remaining:
+        pid = int(process["pid"])
+        try:
+            os.kill(pid, signal.SIGKILL)
+            killed.append(pid)
+        except ProcessLookupError:
+            continue
+        except PermissionError:
+            continue
+
+    lock = _read_apply_run_lock_status(lock_path)
+    removed_lock = False
+    if lock["exists"] and lock["stale"]:
+        try:
+            Path(lock["path"]).unlink()
+            removed_lock = True
+        except FileNotFoundError:
+            pass
+
+    after = inspect_apply_environment(lock_path)
+    return {
+        "before": before,
+        "after": after,
+        "terminated_pids": terminated,
+        "killed_pids": killed,
+        "removed_lock": removed_lock,
+    }
+
+
+def print_apply_cleanup_summary(summary: dict[str, Any]) -> None:
+    after = summary["after"]
+    lines = [
+        f"terminated_pids={summary['terminated_pids'] or '-'}",
+        f"killed_pids={summary['killed_pids'] or '-'}",
+        f"removed_stale_lock={summary['removed_lock']}",
+        f"safe_to_start={after['safe_to_start']}",
+    ]
+    console.print(
+        Panel(
+            "\n".join(lines),
+            title="Apply Cleanup",
+            style="green" if after["safe_to_start"] else "yellow",
+        )
+    )
+    if not after["safe_to_start"]:
+        print_apply_preflight_summary(after)
+
+
 def shortlist_jobs(
     client: AirtableClient,
     *,
     threshold: int,
     record_ids: list[str] | None = None,
+    source: str | None = None,
     dry_run: bool = False,
 ) -> dict[str, Any]:
     ensure_application_fields(client, dry_run=dry_run)
     records = _fetch_offer_records(client)
-    updates = _prepare_shortlist_updates(records, threshold=threshold, record_ids=record_ids or [])
+    updates = _prepare_shortlist_updates(records, threshold=threshold, record_ids=record_ids or [], source=source)
     if dry_run:
-        _print_shortlist_preview(updates, threshold)
+        _print_shortlist_preview(updates, threshold, source=source)
         return {"updated": 0, "candidates": len(updates), "dry_run": True}
     result = client.batch_update_records(updates)
-    console.print(Panel(f"Shortlisted {len(result)} job(s) as Ready.", title="Apply Shortlist", style="green"))
+    label = source or "all supported sources"
+    console.print(Panel(f"Shortlisted {len(result)} job(s) as Ready for {label}.", title="Apply Shortlist", style="green"))
     return {"updated": len(result), "candidates": len(updates), "dry_run": False}
 
 
@@ -415,12 +630,13 @@ async def apply_to_jobs(
     dry_run: bool = False,
     batch_tag: str | None = None,
     session_state_path: str = DEFAULT_APPLY_SESSION_STATE_PATH,
+    source: str | None = None,
 ) -> dict[str, Any]:
     ensure_application_fields(client, dry_run=dry_run)
     records = _fetch_offer_records(client)
-    selected = _select_apply_candidates(records, batch_size=batch_size, record_ids=record_ids or [])
+    selected = _select_apply_candidates(records, batch_size=batch_size, record_ids=record_ids or [], source=source)
     if dry_run:
-        _print_apply_preview(selected, batch_size)
+        _print_apply_preview(selected, batch_size, source=source)
         return {"processed": 0, "candidates": len(selected), "dry_run": True}
 
     if not selected:
@@ -432,6 +648,7 @@ async def apply_to_jobs(
             "candidate_profile.example.json or pass --candidate-profile."
         )
 
+    assert_apply_environment_ready()
     run_lock_path = _acquire_apply_run_lock()
     runtime = await StagehandRuntime.create(session_state_path=session_state_path)
     processed = 0
@@ -471,8 +688,9 @@ def _prepare_shortlist_updates(
     *,
     threshold: int,
     record_ids: list[str],
+    source: str | None,
 ) -> list[dict[str, Any]]:
-    selected = _select_shortlist_candidates(records, threshold=threshold, record_ids=record_ids)
+    selected = _select_shortlist_candidates(records, threshold=threshold, record_ids=record_ids, source=source)
     updates: list[dict[str, Any]] = []
     now = _now_iso()
     for record in selected:
@@ -491,14 +709,19 @@ def _select_shortlist_candidates(
     *,
     threshold: int,
     record_ids: list[str],
+    source: str | None,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     record_id_filter = set(record_ids)
+    normalized_source = (source or "").strip().lower()
     for record in records:
         if record_id_filter and record["id"] not in record_id_filter:
             continue
         fields = record.get("fields", {})
-        if str(fields.get("Source") or "").strip() not in APPLY_SUPPORTED_SOURCES:
+        record_source = str(fields.get("Source") or "").strip()
+        if record_source not in APPLY_SUPPORTED_SOURCES:
+            continue
+        if normalized_source and record_source.lower() != normalized_source:
             continue
         if not str(fields.get("Link") or "").strip():
             continue
@@ -517,14 +740,19 @@ def _select_apply_candidates(
     *,
     batch_size: int,
     record_ids: list[str],
+    source: str | None,
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     record_id_filter = set(record_ids)
+    normalized_source = (source or "").strip().lower()
     for record in records:
         if record_id_filter and record["id"] not in record_id_filter:
             continue
         fields = record.get("fields", {})
-        if str(fields.get("Source") or "").strip() not in APPLY_SUPPORTED_SOURCES:
+        record_source = str(fields.get("Source") or "").strip()
+        if record_source not in APPLY_SUPPORTED_SOURCES:
+            continue
+        if normalized_source and record_source.lower() != normalized_source:
             continue
         if _application_status(fields) != APPLICATION_STATUS_APPROVED:
             continue
@@ -533,6 +761,123 @@ def _select_apply_candidates(
         selected.append(record)
     selected.sort(key=_queue_sort_key, reverse=True)
     return selected[:batch_size]
+
+
+def inspect_jobs(
+    client: AirtableClient,
+    *,
+    source: str | None = None,
+    limit: int = 20,
+) -> dict[str, Any]:
+    records = _fetch_offer_records(client)
+    normalized_source = (source or "").strip().lower()
+    filtered: list[dict[str, Any]] = []
+    for record in records:
+        fields = record.get("fields", {})
+        record_source = str(fields.get("Source") or "").strip()
+        if record_source not in APPLY_SUPPORTED_SOURCES:
+            continue
+        if normalized_source and record_source.lower() != normalized_source:
+            continue
+        if not str(fields.get("Link") or "").strip():
+            continue
+        filtered.append(record)
+
+    if not filtered:
+        console.print(
+            Panel(
+                f"No supported apply candidates found for source={source or 'all'}.",
+                title="Apply Inspect",
+                style="yellow",
+            )
+        )
+        return {"count": 0, "source": source, "records": []}
+
+    filtered.sort(key=_queue_sort_key, reverse=True)
+    status_counts = Counter(_application_status(record.get("fields", {})) or "(empty)" for record in filtered)
+    scored_count = sum(1 for record in filtered if str(record.get("fields", {}).get("Score") or "").strip())
+    label = source or "all supported sources"
+    summary_lines = [
+        f"source={label}",
+        f"records={len(filtered)}",
+        f"scored={scored_count}",
+        f"unscored={len(filtered) - scored_count}",
+        "statuses=" + ", ".join(f"{name}:{count}" for name, count in sorted(status_counts.items())),
+    ]
+    console.print(Panel("\n".join(summary_lines), title="Apply Inspect", style="blue"))
+
+    table = Table(title=f"Top {min(limit, len(filtered))} candidate(s)")
+    table.add_column("ID", style="cyan")
+    table.add_column("Score", justify="right")
+    table.add_column("Status", style="magenta")
+    table.add_column("Company")
+    table.add_column("Position")
+    for record in filtered[:limit]:
+        fields = record.get("fields", {})
+        table.add_row(
+            str(record["id"]),
+            str(fields.get("Score") or "-"),
+            _application_status(fields) or "-",
+            str(fields.get("Company") or "-"),
+            str(fields.get("Position") or "-"),
+        )
+    console.print(table)
+    return {"count": len(filtered), "source": source, "records": filtered[:limit]}
+
+
+def approve_jobs(
+    client: AirtableClient,
+    *,
+    record_ids: list[str],
+    dry_run: bool = False,
+) -> dict[str, Any]:
+    if not record_ids:
+        raise RuntimeError("approve mode requires at least one --record-ids value.")
+
+    ensure_application_fields(client, dry_run=dry_run)
+    records = _fetch_offer_records(client)
+    record_id_filter = set(record_ids)
+    updates: list[dict[str, Any]] = []
+    for record in records:
+        if record["id"] not in record_id_filter:
+            continue
+        fields = record.get("fields", {})
+        source = str(fields.get("Source") or "").strip()
+        if source not in APPLY_SUPPORTED_SOURCES:
+            continue
+        if not str(fields.get("Link") or "").strip():
+            continue
+        status = _application_status(fields)
+        if status not in APPROVABLE_APPLICATION_STATUSES:
+            continue
+        now = _now_iso()
+        updates.append(
+            {
+                "id": record["id"],
+                "fields": {
+                    "ApplicationStatus": APPLICATION_STATUS_APPROVED,
+                    "ApplicationApprovedAt": now,
+                    "ApplicationUpdatedAt": now,
+                    "ApplicationNotes": "Approved for board-by-board apply test.",
+                },
+            }
+        )
+
+    if dry_run:
+        console.print(
+            Panel(
+                f"Dry run: {len(updates)} job(s) would be marked Approved.",
+                title="Apply Approve",
+                style="blue",
+            )
+        )
+        for update in updates[:20]:
+            console.print(update)
+        return {"updated": 0, "candidates": len(updates), "dry_run": True}
+
+    result = client.batch_update_records(updates)
+    console.print(Panel(f"Approved {len(result)} job(s) for apply testing.", title="Apply Approve", style="green"))
+    return {"updated": len(result), "candidates": len(updates), "dry_run": False}
 
 
 def _queue_sort_key(record: dict[str, Any]) -> tuple[float, float]:
@@ -662,7 +1007,51 @@ async def _assist_application_for_record(
                 selected_apply_url=apply_url,
                 login_handoff=login_handoff,
             )
+        recovery_notes: list[str] = []
+        if source == "pracuj" and login_handoff:
+            recovered_page, recovered_url, recovery_note = await _recover_apply_page_after_successful_login(
+                runtime,
+                page=apply_page,
+                source=source,
+                job_url=url,
+            )
+            if recovered_page is None:
+                return ApplicationAttemptResult(
+                    record_id=record_id,
+                    status=APPLICATION_STATUS_NEEDS_REVIEW,
+                    note=recovery_note or "Login completed, but I could not reopen the apply flow safely.",
+                    selected_apply_url=apply_url,
+                    login_handoff=login_handoff,
+                )
+            apply_page = recovered_page
+            apply_url = recovered_url or apply_url
+            apply_note = "; ".join(part for part in (apply_note, recovery_note) if part).strip(" ;")
+        closed_apply_note = await _detect_closed_apply_state(apply_page)
+        if closed_apply_note:
+            return ApplicationAttemptResult(
+                record_id=record_id,
+                status=APPLICATION_STATUS_SKIPPED,
+                note=closed_apply_note,
+                selected_apply_url=apply_url,
+                login_handoff=login_handoff,
+            )
         field_snapshot = await _collect_form_fields(apply_page)
+        if not field_snapshot:
+            prelude_advanced, prelude_note = await _advance_apply_prelude(apply_page)
+            if prelude_advanced:
+                if prelude_note:
+                    recovery_notes.append(prelude_note)
+                field_snapshot = await _collect_form_fields(apply_page)
+        completion_note = await _detect_application_completion_state(apply_page)
+        if completion_note:
+            return ApplicationAttemptResult(
+                record_id=record_id,
+                status=APPLICATION_STATUS_NEEDS_REVIEW,
+                note="; ".join(part for part in (apply_note, *recovery_notes, completion_note) if part).strip(" ;"),
+                selected_apply_url=str(getattr(apply_page, "url", "") or apply_url),
+                login_handoff=login_handoff or justjoin_login_handoff,
+                final_submit_withheld=True,
+            )
         if source == "justjoin":
             (
                 apply_page,
@@ -686,7 +1075,6 @@ async def _assist_application_for_record(
                     selected_apply_url=apply_url,
                     login_handoff=True,
                 )
-        recovery_notes: list[str] = []
         for _ in range(MAX_APPLY_FLOW_RECOVERY_ATTEMPTS):
             if not _looks_like_search_page(field_snapshot) and not _looks_like_company_page(
                 field_snapshot,
@@ -775,6 +1163,29 @@ async def _recover_apply_page_after_login_redirect(
         return recovered_page, recovered_url, "Recovered apply flow after login redirect."
     except Exception:
         return None, "", ""
+
+
+async def _recover_apply_page_after_successful_login(
+    runtime: StagehandRuntime,
+    *,
+    page: Any,
+    source: str,
+    job_url: str,
+) -> tuple[Any | None, str, str]:
+    try:
+        await runtime.save_storage_state()
+        await sleep_ms(900)
+        await runtime.session.navigate(url=job_url, page=page)
+        await accept_cookies(runtime, page)
+        page = await _restore_offer_page_after_cookie_redirect(runtime, page, expected_url=job_url)
+        if source == "pracuj":
+            await dismiss_pracuj_popups(page)
+        reopened_page, reopened_url, reopened_note = await _open_apply_flow(runtime, page)
+        if reopened_page is None:
+            return None, "", reopened_note or "Could not reopen the apply flow after login."
+        return reopened_page, reopened_url, "Reopened apply flow after successful login."
+    except Exception as exc:  # noqa: BLE001
+        return None, "", f"Apply recovery after login failed: {exc}"
 
 
 async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | None, str, str]:
@@ -886,6 +1297,48 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
         _log_apply_event("APPLY_CTA_DIRECT_NAVIGATE", target=target)
         await runtime.session.navigate(url=target, page=page)
         await accept_cookies(runtime, page)
+        if href.startswith("#"):
+            target_info = await _inspect_inpage_apply_target(page, href)
+            _log_apply_event(
+                "APPLY_INPAGE_TARGET",
+                found=str(bool(target_info.get("found"))).lower(),
+                closed=str(bool(target_info.get("closed"))).lower(),
+                action_found=str(bool(target_info.get("action_found"))).lower(),
+                action_href=str(target_info.get("action_href") or "")[:240],
+                action_label=str(target_info.get("action_label") or "")[:120],
+                input_count=str(target_info.get("input_count") or 0),
+                text=str(target_info.get("text") or "")[:240],
+            )
+            if target_info.get("closed"):
+                return page, page.url, "Apply panel is visible, but this offer is no longer accepting applications."
+            if target_info.get("action_found"):
+                nested_target = str(target_info.get("action_href") or "").strip()
+                if nested_target and not nested_target.startswith("#"):
+                    nested_url = urljoin(before_url, nested_target)
+                    _log_apply_event("APPLY_INPAGE_NESTED_NAVIGATE", target=nested_url)
+                    await runtime.session.navigate(url=nested_url, page=page)
+                    await accept_cookies(runtime, page)
+                else:
+                    nested_selector = str(target_info.get("action_selector") or "").strip()
+                    if nested_selector:
+                        try:
+                            await page.locator(nested_selector).first.click(timeout=5000)
+                            _log_apply_event("APPLY_INPAGE_NESTED_CLICKED", selector=nested_selector)
+                        except Exception as exc:
+                            _log_apply_event("APPLY_INPAGE_NESTED_CLICK_FAILED", selector=nested_selector, error=str(exc)[:240])
+                result_page, result_url, result_note = await _wait_for_apply_surface(
+                    runtime,
+                    page,
+                    before_url,
+                    before_pages,
+                    source="inpage",
+                    phase="inpage_apply",
+                )
+                if result_page is not None:
+                    _log_apply_event("APPLY_MODAL_DETECTED", source="inpage", result_url=result_url, note=result_note)
+                    return result_page, result_url, result_note
+            if int(target_info.get("input_count") or 0) > 0:
+                return page, page.url, "Apply panel opened on the same page."
         return page, page.url, "Navigated to detected apply URL."
 
     if not runtime.session.should_skip("observe"):
@@ -1048,9 +1501,29 @@ async def _handle_login_handoff(page: Any) -> tuple[bool, bool]:
     if not await _page_requires_login(page):
         return False, False
 
+    auto_login_note = ""
+    page_url = str(getattr(page, "url", "") or "")
+    if _is_pracuj_login_url(page_url):
+        credentials = _pracuj_credentials_from_env()
+        if credentials is not None:
+            login_attempted = await _attempt_credentials_login(
+                page,
+                email=credentials[0],
+                password=credentials[1],
+                source="pracuj",
+            )
+            if login_attempted:
+                await sleep_ms(1200)
+                if not await _page_requires_login(page):
+                    return True, False
+                auto_login_note = "I reached the Pracuj login page and tried the credentials from env."
+
     console.print(
         Panel(
-            "Login appears to be required. Complete the sign-in flow in the browser, then press Enter here to continue.",
+            (
+                f"{auto_login_note or 'Login appears to be required.'} "
+                "Complete the sign-in flow in the browser, then press Enter here to continue."
+            ),
             title="Apply Login",
             style="yellow",
         )
@@ -1083,10 +1556,11 @@ async def _handle_justjoin_pre_login(
             await _advance_justjoin_sign_in_flow(page)
             credentials = _justjoin_credentials_from_env()
             if credentials is not None:
-                login_attempted = await _attempt_justjoin_credentials_login(
+                login_attempted = await _attempt_credentials_login(
                     page,
                     email=credentials[0],
                     password=credentials[1],
+                    source="justjoin",
                 )
                 if login_attempted:
                     credentials_note = "I clicked JustJoin sign-in and tried the credentials from env."
@@ -1301,140 +1775,206 @@ def _justjoin_credentials_from_env() -> tuple[str, str] | None:
     return None
 
 
-async def _attempt_justjoin_credentials_login(page: Any, *, email: str, password: str) -> bool:
+def _pracuj_credentials_from_env() -> tuple[str, str] | None:
+    email = str(os.getenv("PRACUJ_EMAIL") or "").strip()
+    password = str(os.getenv("PRACUJ_PASSWORD") or "").strip()
+    if email and password:
+        return email, password
+    return None
+
+
+def _is_pracuj_login_url(url: str) -> bool:
+    lowered = str(url or "").strip().lower()
+    return lowered.startswith("https://login.pracuj.pl/") or "login.pracuj.pl" in lowered
+
+
+async def _auth_surface_snapshot(page: Any) -> dict[str, Any]:
+    try:
+        snapshot = await page.evaluate(
+            """() => {
+                const visible = (el) => {
+                  if (!el) return false;
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === "hidden" || style.display === "none") return false;
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const inputs = Array.from(document.querySelectorAll('input')).filter((el) => visible(el));
+                const classify = (el) => {
+                  const type = (el.getAttribute('type') || '').toLowerCase();
+                  const auto = (el.getAttribute('autocomplete') || '').toLowerCase();
+                  const name = (el.getAttribute('name') || '').toLowerCase();
+                  const id = (el.getAttribute('id') || '').toLowerCase();
+                  const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                  const label = (el.closest('label')?.innerText || '').toLowerCase();
+                  const text = `${type} ${auto} ${name} ${id} ${placeholder} ${label}`;
+                  if (type === 'password' || auto.includes('password')) return 'password';
+                  if (
+                    type === 'email' ||
+                    auto.includes('email') ||
+                    auto.includes('username') ||
+                    text.includes('email') ||
+                    text.includes('login') ||
+                    text.includes('adres e-mail')
+                  ) {
+                    return 'email';
+                  }
+                  return 'other';
+                };
+                const kinds = inputs.map((el) => classify(el));
+                return {
+                  emailVisible: kinds.includes('email'),
+                  passwordVisible: kinds.includes('password'),
+                  inputCount: inputs.length,
+                  title: (document.title || '').toLowerCase(),
+                  url: (location.href || '').toLowerCase(),
+                };
+            }"""
+        )
+    except Exception:
+        return {"emailVisible": False, "passwordVisible": False, "inputCount": 0, "title": "", "url": ""}
+    return snapshot if isinstance(snapshot, dict) else {"emailVisible": False, "passwordVisible": False, "inputCount": 0, "title": "", "url": ""}
+
+
+async def _find_visible_auth_control(page: Any, selectors: tuple[str, ...]) -> Any | None:
+    for selector in selectors:
+        try:
+            locator = page.locator(selector)
+            count = await locator.count()
+        except Exception:
+            continue
+        for index in range(min(count, 8)):
+            candidate = locator.nth(index)
+            try:
+                if await candidate.is_visible():
+                    return candidate
+            except Exception:
+                continue
+    return None
+
+
+async def _find_visible_auth_button(page: Any) -> Any | None:
+    locator = page.locator("button, [role='button'], input[type='submit']")
+    try:
+        count = await locator.count()
+    except Exception:
+        return None
+    labels = ("dalej", "continue", "next", "sign in", "log in", "zaloguj")
+    fallback = None
+    for index in range(min(count, 20)):
+        candidate = locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            text = str((await candidate.inner_text()) or "").strip().lower()
+            if not text:
+                text = str((await candidate.get_attribute("value")) or (await candidate.get_attribute("aria-label")) or "").strip().lower()
+            if fallback is None:
+                fallback = candidate
+            if text in labels or any(label in text for label in labels):
+                return candidate
+        except Exception:
+            continue
+    return fallback
+
+
+async def _attempt_playwright_auth_step(page: Any, *, email: str, password: str) -> dict[str, Any]:
+    email_input = await _find_visible_auth_control(
+        page,
+        (
+            'input[type="email"]',
+            'input[autocomplete*="email"]',
+            'input[autocomplete*="username"]',
+            'input[name*="email" i]',
+            'input[id*="email" i]',
+        ),
+    )
+    password_input = await _find_visible_auth_control(
+        page,
+        (
+            'input[type="password"]',
+            'input[autocomplete*="password"]',
+            'input[name*="password" i]',
+            'input[id*="password" i]',
+        ),
+    )
+
+    if email_input is None and password_input is None:
+        return {"attempted": False, "reason": "no_auth_inputs"}
+
+    submit_button = await _find_visible_auth_button(page)
+
+    if email_input is not None and password_input is None:
+        await email_input.fill(email)
+        if submit_button is not None:
+            await submit_button.click(timeout=5000)
+            return {"attempted": True, "reason": "email_only_step", "submitted": "continue"}
+        await email_input.press("Enter")
+        return {"attempted": True, "reason": "email_only_step", "submitted": "enter"}
+
+    if email_input is None and password_input is not None:
+        await password_input.fill(password)
+        if submit_button is not None:
+            await submit_button.click(timeout=5000)
+            return {"attempted": True, "reason": "password_only_step", "submitted": "continue"}
+        await password_input.press("Enter")
+        return {"attempted": True, "reason": "password_only_step", "submitted": "enter"}
+
+    await email_input.fill(email)
+    await password_input.fill(password)
+    if submit_button is not None:
+        await submit_button.click(timeout=5000)
+        return {"attempted": True, "reason": "email_and_password", "submitted": "continue"}
+    await password_input.press("Enter")
+    return {"attempted": True, "reason": "email_and_password", "submitted": "enter"}
+
+
+async def _attempt_credentials_login(page: Any, *, email: str, password: str, source: str) -> bool:
     last_result: dict[str, Any] = {}
     for attempt in range(1, 6):
+        surface_before = await _auth_surface_snapshot(page)
         try:
-            result = await page.evaluate(
-                """({ email, password }) => {
-                    const visible = (el) => {
-                      if (!el) return false;
-                      const style = window.getComputedStyle(el);
-                      if (style.visibility === "hidden" || style.display === "none") return false;
-                      const rect = el.getBoundingClientRect();
-                      return rect.width > 0 && rect.height > 0;
-                    };
-                    const inputs = Array.from(document.querySelectorAll('input'));
-                    const passwordInput = inputs.find((el) =>
-                      visible(el) && (
-                        (el.getAttribute('type') || '').toLowerCase() === 'password' ||
-                        ((el.getAttribute('autocomplete') || '').toLowerCase().includes('password'))
-                      )
-                    );
-                    const emailInput = inputs.find((el) => {
-                      if (!visible(el) || el === passwordInput) return false;
-                      const type = (el.getAttribute('type') || '').toLowerCase();
-                      const auto = (el.getAttribute('autocomplete') || '').toLowerCase();
-                      const name = (el.getAttribute('name') || '').toLowerCase();
-                      const id = (el.getAttribute('id') || '').toLowerCase();
-                      const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
-                      const label = (el.closest('label')?.innerText || '').toLowerCase();
-                      return (
-                        type === 'email' ||
-                        auto.includes('email') ||
-                        auto.includes('username') ||
-                        name.includes('email') ||
-                        name.includes('login') ||
-                        id.includes('email') ||
-                        id.includes('login') ||
-                        placeholder.includes('email') ||
-                        placeholder.includes('login') ||
-                        label.includes('email')
-                      );
-                    });
-
-                    const inputEvent = new Event('input', { bubbles: true });
-                    const changeEvent = new Event('change', { bubbles: true });
-                    const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
-                    const continueButton = buttons.find((el) => {
-                      if (!visible(el)) return false;
-                      const text = ((el.textContent || el.getAttribute('value') || el.getAttribute('aria-label') || '')).trim().toLowerCase();
-                      return (
-                        text === 'continue' ||
-                        text === 'next' ||
-                        text === 'dalej' ||
-                        text === 'sign in' ||
-                        text === 'log in' ||
-                        text === 'zaloguj'
-                      );
-                    });
-
-                    if (!emailInput && !passwordInput) {
-                      return { attempted: false, reason: 'no_auth_inputs' };
-                    }
-
-                    if (emailInput && !passwordInput) {
-                      emailInput.focus();
-                      emailInput.value = email;
-                      emailInput.dispatchEvent(inputEvent);
-                      emailInput.dispatchEvent(changeEvent);
-                      if (continueButton) {
-                        continueButton.click();
-                        return { attempted: true, reason: 'email_only_step', submitted: 'continue' };
-                      }
-                      return { attempted: true, reason: 'email_only_step', submitted: 'filled_only' };
-                    }
-
-                    if (!emailInput && passwordInput) {
-                      passwordInput.focus();
-                      passwordInput.value = password;
-                      passwordInput.dispatchEvent(inputEvent);
-                      passwordInput.dispatchEvent(changeEvent);
-                      if (continueButton) {
-                        continueButton.click();
-                        return { attempted: true, reason: 'password_only_step', submitted: 'continue' };
-                      }
-                      return { attempted: true, reason: 'password_only_step', submitted: 'filled_only' };
-                    }
-
-                    emailInput.focus();
-                    emailInput.value = email;
-                    emailInput.dispatchEvent(inputEvent);
-                    emailInput.dispatchEvent(changeEvent);
-                    passwordInput.focus();
-                    passwordInput.value = password;
-                    passwordInput.dispatchEvent(inputEvent);
-                    passwordInput.dispatchEvent(changeEvent);
-
-                    const form = passwordInput.form || emailInput.form;
-                    if (form) {
-                      const submitter = form.querySelector('button[type="submit"], input[type="submit"]');
-                      if (submitter && visible(submitter)) {
-                        submitter.click();
-                        return { attempted: true, reason: 'email_and_password', submitted: 'button' };
-                      }
-                      if (typeof form.requestSubmit === 'function') {
-                        form.requestSubmit();
-                        return { attempted: true, reason: 'email_and_password', submitted: 'requestSubmit' };
-                      }
-                      form.submit();
-                      return { attempted: true, reason: 'email_and_password', submitted: 'submit' };
-                    }
-
-                    if (continueButton) {
-                      continueButton.click();
-                      return { attempted: true, reason: 'email_and_password', submitted: 'continue' };
-                    }
-
-                    return { attempted: true, reason: 'email_and_password', submitted: 'filled_only' };
-                }""",
-                {"email": email, "password": password},
-            )
+            result = await _attempt_playwright_auth_step(page, email=email, password=password)
         except Exception as exc:  # noqa: BLE001
-            _log_apply_event("JUSTJOIN_CREDENTIAL_LOGIN_ERROR", error=str(exc)[:240], attempt=str(attempt))
+            _log_apply_event("APPLY_CREDENTIAL_LOGIN_ERROR", source=source, error=str(exc)[:240], attempt=str(attempt))
             return False
 
         last_result = dict(result or {})
         attempted = bool(last_result.get("attempted"))
         _log_apply_event(
-            "JUSTJOIN_CREDENTIAL_LOGIN_ATTEMPT",
+            "APPLY_CREDENTIAL_LOGIN_ATTEMPT",
+            source=source,
             attempt=str(attempt),
             attempted=str(attempted).lower(),
             reason=str(last_result.get("reason") or "-")[:120],
             submitted=str(last_result.get("submitted") or "-")[:120],
+            email_visible=str(bool(surface_before.get("emailVisible"))).lower(),
+            password_visible=str(bool(surface_before.get("passwordVisible"))).lower(),
             page_url=str(getattr(page, "url", "") or ""),
         )
-        if attempted and str(last_result.get("reason") or "") not in {"no_auth_inputs", "email_only_step"}:
+
+        reason = str(last_result.get("reason") or "")
+        if attempted and reason == "email_only_step":
+            password_appeared = False
+            for wait_index in range(1, 7):
+                await sleep_ms(900)
+                surface_after = await _auth_surface_snapshot(page)
+                _log_apply_event(
+                    "APPLY_CREDENTIAL_LOGIN_WAIT",
+                    source=source,
+                    attempt=str(attempt),
+                    wait_step=str(wait_index),
+                    email_visible=str(bool(surface_after.get("emailVisible"))).lower(),
+                    password_visible=str(bool(surface_after.get("passwordVisible"))).lower(),
+                    input_count=str(surface_after.get("inputCount") or 0),
+                    page_url=str(getattr(page, "url", "") or ""),
+                )
+                if bool(surface_after.get("passwordVisible")):
+                    password_appeared = True
+                    break
+            if password_appeared:
+                continue
+        if attempted and reason not in {"no_auth_inputs", "email_only_step"}:
             return True
         if attempt < 5:
             await sleep_ms(700)
@@ -1596,6 +2136,13 @@ async def _page_requires_login(page: Any) -> bool:
                     ];
                     return `${(el.tagName || '').toLowerCase()} ${(el.getAttribute('type') || '').toLowerCase()} ${parts.join(' ')}`.toLowerCase();
                   });
+                const authFieldCount = fields.filter((value) =>
+                  value.includes('email') ||
+                  value.includes('username') ||
+                  value.includes('password') ||
+                  value.includes('login') ||
+                  value.includes('adres e-mail')
+                ).length;
                 const applyFieldCount = fields.filter((value) =>
                   value.includes('email') ||
                   value.includes('first and last name') ||
@@ -1609,6 +2156,8 @@ async def _page_requires_login(page: Any) -> bool:
                   hasPassword,
                   markerHit,
                   title: (document.title || "").toLowerCase(),
+                  url: (location.href || "").toLowerCase(),
+                  authFieldCount,
                   applyFieldCount,
                 };
             }""",
@@ -1620,13 +2169,69 @@ async def _page_requires_login(page: Any) -> bool:
     if bool(snapshot.get("hasPassword")):
         return True
 
+    page_url = str(snapshot.get("url") or "")
+    title = str(snapshot.get("title") or "")
+    auth_field_count = int(snapshot.get("authFieldCount") or 0)
+    if "login." in page_url or "/login" in page_url:
+        return True
+    if auth_field_count >= 1 and (bool(snapshot.get("markerHit")) or "login" in title or "logowanie" in title):
+        return True
+
     if int(snapshot.get("applyFieldCount") or 0) >= 2:
         return False
 
-    title = str(snapshot.get("title") or "")
     return bool(snapshot.get("markerHit")) or any(
         marker in title for marker in LOGIN_TEXT_MARKERS
     )
+
+
+async def _advance_apply_prelude(page: Any) -> tuple[bool, str]:
+    clicked, details = await _click_visible_action_by_texts(
+        page,
+        (
+            "kontynuuj aplikowanie",
+            "continue application",
+            "continue applying",
+        ),
+    )
+    if not clicked:
+        return False, ""
+    _log_apply_event(
+        "APPLY_PRELUDE_CLICKED",
+        text=str(details.get("text") or "-")[:120],
+        href=str(details.get("href") or "-")[:240],
+        index=str(details.get("index") or "-"),
+        page_url=str(getattr(page, "url", "") or ""),
+    )
+    await sleep_ms(1200)
+    return True, "Advanced the application prelude screen."
+
+
+async def _detect_application_completion_state(page: Any) -> str:
+    try:
+        snapshot = await page.evaluate(
+            """(markers) => {
+                const text = ((document.body?.innerText || '') + ' ' + (document.title || '')).toLowerCase();
+                const marker = markers.find((item) => text.includes(item));
+                return {
+                  marker: marker || '',
+                  url: (location.href || '').toLowerCase(),
+                  title: (document.title || '').toLowerCase(),
+                };
+            }""",
+            list(APPLICATION_SUCCESS_TEXT_MARKERS),
+        )
+    except Exception:
+        return ""
+    if not isinstance(snapshot, dict):
+        return ""
+    page_url = str(snapshot.get("url") or "")
+    marker = str(snapshot.get("marker") or "").strip()
+    if "dziekujemy.pracuj.pl" in page_url:
+        return "Application confirmation page detected after opening the apply flow."
+    if marker:
+        return f"Application confirmation state detected ({marker})."
+    return ""
 
 
 async def _page_has_apply_form(page: Any) -> bool:
@@ -1683,9 +2288,100 @@ async def _page_has_apply_form(page: Any) -> bool:
     return int(snapshot.get("applyFieldCount") or 0) >= 2
 
 
+async def _inspect_inpage_apply_target(page: Any, href: str) -> dict[str, Any]:
+    target_id = href[1:] if href.startswith("#") else href
+    if not target_id:
+        return {"found": False}
+    try:
+        snapshot = await page.evaluate(
+            """({ targetId, applyMarkers, excludeMarkers, closedMarkers }) => {
+                const normalize = (value) => (value || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                const visible = (el) => {
+                  if (!el) return false;
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === "hidden" || style.display === "none") return false;
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const root = document.getElementById(targetId);
+                if (!root) return { found: false };
+                const text = normalize(root.innerText || "");
+                const actions = Array.from(root.querySelectorAll('a, button, [role="button"]'));
+                let action = null;
+                let actionIndex = 0;
+                for (const el of actions) {
+                  if (!visible(el)) continue;
+                  const label = normalize(el.textContent || el.getAttribute('aria-label') || '');
+                  const href = el.tagName === 'A' ? (el.getAttribute('href') || el.href || '') : '';
+                  const haystack = `${label} ${normalize(href)}`;
+                  if (!applyMarkers.some((marker) => haystack.includes(marker))) continue;
+                  if (excludeMarkers.some((marker) => haystack.includes(marker))) continue;
+                  el.setAttribute('data-jsb-inpage-apply-index', String(actionIndex));
+                  action = {
+                    label,
+                    href,
+                    selector: `[data-jsb-inpage-apply-index="${actionIndex}"]`,
+                  };
+                  break;
+                }
+                return {
+                  found: true,
+                  text,
+                  closed: closedMarkers.some((marker) => text.includes(marker)),
+                  action_found: !!action,
+                  action_label: action?.label || '',
+                  action_href: action?.href || '',
+                  action_selector: action?.selector || '',
+                  input_count: root.querySelectorAll('input, textarea, select').length,
+                };
+            }""",
+            {
+                "targetId": target_id,
+                "applyMarkers": list(APPLY_TEXT_MARKERS),
+                "excludeMarkers": list(APPLY_EXCLUDE_MARKERS),
+                "closedMarkers": list(APPLY_CLOSED_TEXT_MARKERS),
+            },
+        )
+    except Exception:
+        return {"found": False}
+    return snapshot if isinstance(snapshot, dict) else {"found": False}
+
+
+async def _detect_closed_apply_state(page: Any) -> str:
+    try:
+        snapshot = await page.evaluate(
+            """(closedMarkers) => {
+                const normalize = (value) => (value || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                const roots = [
+                  document.querySelector('#offer-apply-panel'),
+                  ...Array.from(document.querySelectorAll('[role="dialog"], [aria-modal="true"], dialog, [data-state="open"]')),
+                  document.body,
+                ].filter(Boolean);
+                for (const root of roots) {
+                  const text = normalize(root.innerText || '');
+                  const marker = closedMarkers.find((item) => text.includes(item));
+                  if (marker) {
+                    return { closed: true, marker, text: text.slice(0, 240) };
+                  }
+                }
+                return { closed: false };
+            }""",
+            list(APPLY_CLOSED_TEXT_MARKERS),
+        )
+    except Exception:
+        return ""
+    if not isinstance(snapshot, dict) or not snapshot.get("closed"):
+        return ""
+    marker = str(snapshot.get("marker") or "").strip()
+    if marker:
+        return f"This offer is no longer accepting applications ({marker})."
+    return "This offer is no longer accepting applications."
+
+
 @dataclass
 class FillResult:
     filled_fields: list[str] = field(default_factory=list)
+    prefilled_fields: list[str] = field(default_factory=list)
     semantic_answers: list[str] = field(default_factory=list)
     cv_uploaded: bool = False
     cover_letter_inserted: bool = False
@@ -1696,6 +2392,8 @@ class FillResult:
         parts: list[str] = []
         if self.filled_fields:
             parts.append(f"Filled: {', '.join(self.filled_fields[:6])}")
+        if self.prefilled_fields:
+            parts.append(f"Prefilled: {', '.join(self.prefilled_fields[:6])}")
         if self.semantic_answers:
             parts.append(f"Answered: {', '.join(self.semantic_answers[:6])}")
         if self.cv_uploaded:
@@ -1765,6 +2463,9 @@ async def _collect_form_fields(page: Any) -> list[dict[str, Any]]:
                       label: labelFor(el),
                       accept: (el.getAttribute('accept') || '').trim(),
                       required: el.required || el.getAttribute('aria-required') === 'true',
+                      disabled: !!el.disabled,
+                      readOnly: !!el.readOnly,
+                      value: typeof el.value === 'string' ? el.value : '',
                       checked: !!el.checked,
                       options,
                     };
@@ -1785,10 +2486,13 @@ async def _fill_detected_fields(
     cover_letter_draft: str,
 ) -> FillResult:
     result = FillResult()
+    filled_once: set[str] = set()
     for field_meta in field_snapshot:
         field_type = _classify_field(field_meta)
         selector = str(field_meta.get("selector") or "").strip()
         if not selector or not field_type:
+            continue
+        if bool(field_meta.get("disabled")):
             continue
 
         try:
@@ -1828,12 +2532,27 @@ async def _fill_detected_fields(
                 result.skipped_fields.append(semantic_key or field_type)
             continue
 
+        if field_type in {"first_name", "last_name", "full_name", "phone", "email"}:
+            current_value = str(field_meta.get("value") or "").strip()
+            if field_type in filled_once:
+                continue
+            if current_value:
+                filled_once.add(field_type)
+                result.prefilled_fields.append(field_type)
+                continue
+            if bool(field_meta.get("readOnly")) and current_value:
+                filled_once.add(field_type)
+                result.prefilled_fields.append(field_type)
+                continue
+
         try:
             if field_meta.get("tag") == "select":
                 await locator.select_option(label=value)
             else:
                 await locator.fill(value)
             result.filled_fields.append(field_type)
+            if field_type in {"first_name", "last_name", "full_name", "phone", "email"}:
+                filled_once.add(field_type)
         except Exception:
             result.skipped_fields.append(field_type)
     return result
@@ -2070,10 +2789,11 @@ def _truncate_text(value: str, max_chars: int) -> str:
     return cleaned[: max_chars - 3].rstrip(" ,;:-") + "..."
 
 
-def _print_shortlist_preview(updates: list[dict[str, Any]], threshold: int) -> None:
+def _print_shortlist_preview(updates: list[dict[str, Any]], threshold: int, *, source: str | None) -> None:
     console.print(
         Panel(
-            f"Dry run: {len(updates)} job(s) would be marked Ready at threshold {threshold}.",
+            f"Dry run: {len(updates)} job(s) would be marked Ready at threshold {threshold} "
+            f"for {source or 'all supported sources'}.",
             title="Apply Shortlist",
             style="blue",
         )
@@ -2082,10 +2802,11 @@ def _print_shortlist_preview(updates: list[dict[str, Any]], threshold: int) -> N
         console.print(update)
 
 
-def _print_apply_preview(records: list[dict[str, Any]], batch_size: int) -> None:
+def _print_apply_preview(records: list[dict[str, Any]], batch_size: int, *, source: str | None) -> None:
     console.print(
         Panel(
-            f"Dry run: {len(records)} approved job(s) would be processed (batch size {batch_size}).",
+            f"Dry run: {len(records)} approved job(s) would be processed (batch size {batch_size}) "
+            f"for {source or 'all supported sources'}.",
             title="Apply",
             style="blue",
         )

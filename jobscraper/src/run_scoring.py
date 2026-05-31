@@ -47,10 +47,17 @@ def _read_ids_file(path: str) -> List[str]:
     return ids
 
 
-def _pick_unscored_ids(airtable_client: AirtableClient, limit: int) -> List[str]:
+def _pick_unscored_ids(airtable_client: AirtableClient, limit: int, source: Optional[str] = None) -> List[str]:
     table = airtable_client._connect()
-    records = table.all(fields=["Score"])
-    unscored = [record["id"] for record in records if "Score" not in record.get("fields", {})]
+    records = table.all(fields=["Score", "Source"])
+    normalized_source = (source or "").strip().lower()
+    unscored = []
+    for record in records:
+        fields = record.get("fields", {})
+        if normalized_source and str(fields.get("Source") or "").strip().lower() != normalized_source:
+            continue
+        if "Score" not in fields:
+            unscored.append(record["id"])
     return unscored[:limit]
 
 
@@ -71,6 +78,10 @@ def _parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
         "--unscored",
         action="store_true",
         help="Score offers that currently have empty Score field",
+    )
+    parser.add_argument(
+        "--source",
+        help="Restrict --unscored scoring to a single source (for example: pracuj, indeed, nofluffjobs).",
     )
     parser.add_argument(
         "--limit",
@@ -128,7 +139,7 @@ async def _run() -> int:
         record_ids.extend(_read_ids_file(args.ids_file))
 
     if args.unscored:
-        record_ids.extend(_pick_unscored_ids(airtable_client, args.limit))
+        record_ids.extend(_pick_unscored_ids(airtable_client, args.limit, source=args.source))
 
     record_ids = [rid for rid in record_ids if rid]
     seen = set()
