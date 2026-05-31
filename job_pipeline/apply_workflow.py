@@ -54,6 +54,7 @@ APPLY_SUPPORTED_SOURCES = set(supported_site_names())
 DEFAULT_APPLY_THRESHOLD = 80
 DEFAULT_APPLY_BATCH_SIZE = 3
 DEFAULT_APPLY_SESSION_STATE_PATH = ".session_states/apply-session.json"
+DEFAULT_APPLY_RUN_LOCK_PATH = ".session_states/apply-run.lock"
 MAX_APPLY_FLOW_RECOVERY_ATTEMPTS = 3
 APPLICATION_FIELDS = [
     "Link",
@@ -144,7 +145,15 @@ COVER_LETTER_MARKERS = (
 FIELD_PATTERNS = {
     "first_name": ("first name", "given name", "imię", "imie", "firstname", "first_name"),
     "last_name": ("last name", "family name", "surname", "nazwisko", "lastname", "last_name"),
-    "full_name": ("full name", "name", "imię i nazwisko", "imie i nazwisko"),
+    "full_name": (
+        "full name",
+        "first and last name",
+        "your name",
+        "imię i nazwisko",
+        "imie i nazwisko",
+        "fullname",
+        "full_name",
+    ),
     "email": ("email", "e-mail", "mail"),
     "phone": ("phone", "telefon", "mobile"),
     "location_city": ("city", "location", "miasto", "miejscowość"),
@@ -158,6 +167,7 @@ COMMON_ANSWER_PATTERNS = {
     "relocation": ("relocation", "relocate", "przeprowadzk"),
     "salary_expectation": ("salary expectation", "expected salary", "salary"),
     "notice_period": ("notice period", "availability"),
+    "required_consent": ("terms of service", "privacy policy", "accept the terms", "i accept", "regulamin", "polityk"),
 }
 
 
@@ -321,6 +331,63 @@ def generate_batch_tag() -> str:
     return datetime.now(UTC).strftime("apply-%Y%m%d-%H%M%S")
 
 
+def _pid_is_alive(pid: int) -> bool:
+    if pid <= 0:
+        return False
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True
+    return True
+
+
+def _acquire_apply_run_lock(lock_path: str = DEFAULT_APPLY_RUN_LOCK_PATH) -> Path:
+    path = Path(lock_path).expanduser().resolve()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    current_pid = os.getpid()
+
+    if path.exists():
+        raw = path.read_text(encoding="utf-8").strip()
+        stale = True
+        active_pid = 0
+        if raw:
+            try:
+                active_pid = int(raw.splitlines()[0].strip())
+                stale = not _pid_is_alive(active_pid)
+            except ValueError:
+                stale = True
+        if stale:
+            try:
+                path.unlink()
+            except FileNotFoundError:
+                pass
+        else:
+            raise RuntimeError(
+                f"Another apply run is already active (pid={active_pid}). "
+                "Close or stop the existing apply session before starting a new one."
+            )
+
+    path.write_text(f"{current_pid}\n", encoding="utf-8")
+    return path
+
+
+def _release_apply_run_lock(lock_path: Path | None) -> None:
+    if lock_path is None:
+        return
+    try:
+        raw = lock_path.read_text(encoding="utf-8").strip()
+    except FileNotFoundError:
+        return
+    current_pid = str(os.getpid())
+    if raw.splitlines()[:1] == [current_pid]:
+        try:
+            lock_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
 def shortlist_jobs(
     client: AirtableClient,
     *,
@@ -365,6 +432,7 @@ async def apply_to_jobs(
             "candidate_profile.example.json or pass --candidate-profile."
         )
 
+    run_lock_path = _acquire_apply_run_lock()
     runtime = await StagehandRuntime.create(session_state_path=session_state_path)
     processed = 0
     active_batch_tag = batch_tag or generate_batch_tag()
@@ -376,7 +444,10 @@ async def apply_to_jobs(
             client.batch_update_records([_result_to_update(result, batch_tag=active_batch_tag)])
             processed += 1
     finally:
-        await runtime.close()
+        try:
+            await runtime.close()
+        finally:
+            _release_apply_run_lock(run_lock_path)
 
     console.print(
         Panel(
@@ -559,6 +630,21 @@ async def _assist_application_for_record(
         await dismiss_pracuj_popups(page)
 
     try:
+        justjoin_login_handoff = False
+        if source == "justjoin":
+            page, justjoin_login_handoff, justjoin_login_still_required, justjoin_login_note = await _handle_justjoin_pre_login(
+                runtime,
+                page=page,
+                job_url=url,
+            )
+            if justjoin_login_still_required:
+                return ApplicationAttemptResult(
+                    record_id=record_id,
+                    status=APPLICATION_STATUS_NEEDS_REVIEW,
+                    note=justjoin_login_note or "JustJoin login is still required before apply can continue safely.",
+                    selected_apply_url=str(getattr(page, "url", "") or url),
+                    login_handoff=justjoin_login_handoff,
+                )
         apply_page, apply_url, apply_note = await _open_apply_flow(runtime, page)
         if apply_page is None:
             return ApplicationAttemptResult(
@@ -577,6 +663,29 @@ async def _assist_application_for_record(
                 login_handoff=login_handoff,
             )
         field_snapshot = await _collect_form_fields(apply_page)
+        if source == "justjoin":
+            (
+                apply_page,
+                apply_url,
+                field_snapshot,
+                justjoin_login_handoff,
+                justjoin_login_still_required,
+                justjoin_login_note,
+            ) = await _handle_justjoin_login_handoff(
+                runtime,
+                page=apply_page,
+                apply_url=apply_url,
+                job_url=url,
+                field_snapshot=field_snapshot,
+            )
+            if justjoin_login_still_required:
+                return ApplicationAttemptResult(
+                    record_id=record_id,
+                    status=APPLICATION_STATUS_NEEDS_REVIEW,
+                    note=justjoin_login_note or "JustJoin login is still required before apply can continue safely.",
+                    selected_apply_url=apply_url,
+                    login_handoff=True,
+                )
         recovery_notes: list[str] = []
         for _ in range(MAX_APPLY_FLOW_RECOVERY_ATTEMPTS):
             if not _looks_like_search_page(field_snapshot) and not _looks_like_company_page(
@@ -618,7 +727,7 @@ async def _assist_application_for_record(
             status=review_status,
             note=final_note or "Application assist finished.",
             selected_apply_url=apply_url,
-            login_handoff=login_handoff,
+            login_handoff=login_handoff or justjoin_login_handoff,
             cv_uploaded=fill_result.cv_uploaded,
             draft_generated=fill_result.cover_letter_inserted,
             final_submit_withheld=True,
@@ -671,6 +780,11 @@ async def _recover_apply_page_after_login_redirect(
 async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | None, str, str]:
     before_url = page.url
     before_pages = set(runtime.context.pages)
+    _log_apply_event(
+        "APPLY_OPEN_START",
+        page_url=before_url,
+        page_count=len(runtime.context.pages),
+    )
 
     heuristic = await page.evaluate(
         """({ applyMarkers, excludeMarkers }) => {
@@ -683,6 +797,7 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
             };
             const nodes = Array.from(document.querySelectorAll("a, button, [role='button']"));
             let best = null;
+            let index = 0;
             for (const el of nodes) {
               if (!visible(el)) continue;
               const text = normalize(el.textContent || el.getAttribute("aria-label") || "");
@@ -690,41 +805,88 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
               const haystack = `${text} ${normalize(href)}`;
               if (!applyMarkers.some((marker) => haystack.includes(marker))) continue;
               if (excludeMarkers.some((marker) => haystack.includes(marker))) continue;
+              el.setAttribute("data-jsb-apply-trigger-index", String(index));
+              const rect = el.getBoundingClientRect();
               const score = (text.length ? 100 : 0) + (href ? 10 : 0);
               if (!best || score > best.score) {
-                best = { text, href, score };
+                best = {
+                  text,
+                  href,
+                  score,
+                  selector: `[data-jsb-apply-trigger-index="${index}"]`,
+                  tag: (el.tagName || "").toLowerCase(),
+                  x: Math.round(rect.x),
+                  y: Math.round(rect.y),
+                  width: Math.round(rect.width),
+                  height: Math.round(rect.height),
+                };
               }
+              index += 1;
             }
-            if (!best) return { clicked: false, href: "", label: "" };
-            for (const el of nodes) {
-              const text = normalize(el.textContent || el.getAttribute("aria-label") || "");
-              const href = el.tagName === "A" ? (el.getAttribute("href") || el.href || "") : "";
-              if (text === best.text && href === best.href) {
-                el.click();
-                return { clicked: true, href: best.href, label: best.text };
-              }
+            if (!best) {
+              return {
+                found: false,
+                href: "",
+                label: "",
+                selector: "",
+                tag: "",
+                x: 0,
+                y: 0,
+                width: 0,
+                height: 0,
+              };
             }
-            return { clicked: false, href: best.href, label: best.text };
+            return {
+              found: true,
+              href: best.href,
+              label: best.text,
+              selector: best.selector,
+              tag: best.tag,
+              x: best.x,
+              y: best.y,
+              width: best.width,
+              height: best.height,
+            };
         }""",
         {"applyMarkers": list(APPLY_TEXT_MARKERS), "excludeMarkers": list(APPLY_EXCLUDE_MARKERS)},
     )
+    _log_apply_event(
+        "APPLY_CTA_HEURISTIC_FOUND",
+        found=str(bool((heuristic or {}).get("found"))).lower(),
+        href=str((heuristic or {}).get("href") or ""),
+        label=str((heuristic or {}).get("label") or ""),
+        selector=str((heuristic or {}).get("selector") or ""),
+        tag=str((heuristic or {}).get("tag") or ""),
+        box=f"{(heuristic or {}).get('x', 0)},{(heuristic or {}).get('y', 0)},{(heuristic or {}).get('width', 0)},{(heuristic or {}).get('height', 0)}",
+    )
 
-    await sleep_ms(1500)
-    candidate_page = await _select_latest_context_page(runtime, before_pages)
-    if candidate_page and candidate_page.url != before_url:
-        await accept_cookies(runtime, candidate_page)
-        return candidate_page, candidate_page.url, "Apply action opened."
+    selector = str((heuristic or {}).get("selector") or "").strip()
+    if selector:
+        try:
+            await page.locator(selector).first.click(timeout=3000)
+            _log_apply_event("APPLY_CTA_HEURISTIC_CLICKED", selector=selector)
+        except Exception as exc:
+            _log_apply_event("APPLY_CTA_HEURISTIC_CLICK_FAILED", selector=selector, error=str(exc)[:240])
+
+    result_page, result_url, result_note = await _wait_for_apply_surface(
+        runtime,
+        page,
+        before_url,
+        before_pages,
+        source="heuristic",
+        phase="heuristic_click",
+    )
+    if result_page is not None:
+        _log_apply_event("APPLY_MODAL_DETECTED", source="heuristic", result_url=result_url, note=result_note)
+        return result_page, result_url, result_note
 
     href = str((heuristic or {}).get("href") or "").strip()
     if href and page.url == before_url:
         target = urljoin(before_url, href)
+        _log_apply_event("APPLY_CTA_DIRECT_NAVIGATE", target=target)
         await runtime.session.navigate(url=target, page=page)
         await accept_cookies(runtime, page)
         return page, page.url, "Navigated to detected apply URL."
-
-    if page.url != before_url:
-        await accept_cookies(runtime, page)
-        return page, page.url, "Apply action opened."
 
     if not runtime.session.should_skip("observe"):
         try:
@@ -737,16 +899,29 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
                 page=page,
             )
             actions = getattr(observed.data, "result", []) or []
+            _log_apply_event(
+                "APPLY_CTA_STAGEHAND_FOUND",
+                action_count=len(actions),
+                first_action=str(actions[0])[:240] if actions else "",
+            )
             if actions:
                 await runtime.session.act(input=actions[0], page=page)
-                await sleep_ms(1500)
-                candidate_page = await _select_latest_context_page(runtime, before_pages)
-                active_page = candidate_page or page
-                await accept_cookies(runtime, active_page)
-                return active_page, active_page.url, "Apply action opened via Stagehand."
+                _log_apply_event("APPLY_CTA_STAGEHAND_CLICKED", action=str(actions[0])[:240])
+                result_page, result_url, result_note = await _wait_for_apply_surface(
+                    runtime,
+                    page,
+                    before_url,
+                    before_pages,
+                    source="stagehand",
+                    phase="stagehand_click",
+                )
+                if result_page is not None:
+                    _log_apply_event("APPLY_MODAL_DETECTED", source="stagehand", result_url=result_url, note=result_note)
+                    return result_page, result_url, "Apply action opened via Stagehand."
         except Exception:
             pass
 
+    _log_apply_event("APPLY_MODAL_NOT_DETECTED", page_url=page.url)
     return None, "", "No safe apply action was detected."
 
 
@@ -766,6 +941,107 @@ def _stdin_is_interactive() -> bool:
         return sys.stdin.isatty()
     except Exception:
         return False
+
+
+def _log_apply_event(event: str, **fields: Any) -> None:
+    payload = " ".join(f"{key}={_log_apply_value(value)}" for key, value in fields.items())
+    console.print(f"{event} {payload}".strip())
+
+
+def _log_apply_value(value: Any) -> str:
+    text = str(value).replace("\n", "\\n").strip()
+    return text if text else "-"
+
+
+async def _sample_apply_surface(page: Any) -> dict[str, Any]:
+    try:
+        snapshot = await page.evaluate(
+            """() => {
+                const modalRoot = () => {
+                  const candidates = Array.from(document.querySelectorAll(
+                    '[role="dialog"], [aria-modal="true"], dialog, [data-state="open"]'
+                  ));
+                  const visibleCandidate = candidates.find((el) => {
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === "hidden" || style.display === "none") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  });
+                  return visibleCandidate || document;
+                };
+                const visible = (el) => {
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === "hidden" || style.display === "none") return false;
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const root = modalRoot();
+                const nodes = Array.from(root.querySelectorAll('input, textarea, select'))
+                  .filter((el) => visible(el))
+                  .map((el) => {
+                    const text = [
+                      el.getAttribute('name') || '',
+                      el.getAttribute('id') || '',
+                      el.getAttribute('placeholder') || '',
+                      el.getAttribute('aria-label') || '',
+                      el.getAttribute('autocomplete') || '',
+                      el.getAttribute('accept') || '',
+                      el.closest('label')?.innerText || '',
+                    ].join(' ').replace(/\\s+/g, ' ').trim();
+                    return `${(el.tagName || '').toLowerCase()}:${(el.getAttribute('type') || '').toLowerCase()}:${text}`;
+                  });
+                return { fieldCount: nodes.length, samples: nodes.slice(0, 5) };
+            }"""
+        )
+    except Exception:
+        return {"fieldCount": 0, "samples": []}
+    return snapshot if isinstance(snapshot, dict) else {"fieldCount": 0, "samples": []}
+
+
+async def _wait_for_apply_surface(
+    runtime: StagehandRuntime,
+    page: Any,
+    before_url: str,
+    before_pages: set[Any],
+    *,
+    source: str,
+    phase: str,
+    attempts: int = 5,
+    delay_ms: int = 600,
+) -> tuple[Any | None, str, str]:
+    for attempt in range(1, attempts + 1):
+        if attempt > 1:
+            await sleep_ms(delay_ms)
+        candidate_page = await _select_latest_context_page(runtime, before_pages)
+        active_page = candidate_page or page
+        current_url = str(getattr(active_page, "url", "") or "")
+        url_changed = current_url != before_url
+        form_detected = await _page_has_apply_form(active_page)
+        surface = await _sample_apply_surface(active_page)
+        _log_apply_event(
+            "APPLY_POST_CLICK_CHECK",
+            source=source,
+            phase=phase,
+            attempt=attempt,
+            url_changed=str(url_changed).lower(),
+            new_page=str(candidate_page is not None).lower(),
+            form_detected=str(form_detected).lower(),
+            field_count=surface.get("fieldCount", 0),
+            samples=" | ".join(surface.get("samples", [])),
+            page_url=current_url or before_url,
+        )
+        if candidate_page is not None and current_url != before_url:
+            await accept_cookies(runtime, candidate_page)
+            return candidate_page, current_url, "Apply action opened."
+        if form_detected:
+            await accept_cookies(runtime, active_page)
+            if active_page is page:
+                return page, current_url or before_url, "Apply form opened on the same page."
+            return active_page, current_url or before_url, "Apply form opened."
+        if active_page is page and current_url != before_url:
+            await accept_cookies(runtime, page)
+            return page, current_url, "Apply action opened."
+    return None, "", ""
 
 
 async def _handle_login_handoff(page: Any) -> tuple[bool, bool]:
@@ -789,29 +1065,628 @@ async def _handle_login_handoff(page: Any) -> tuple[bool, bool]:
     return True, await _page_requires_login(page)
 
 
+async def _handle_justjoin_pre_login(
+    runtime: StagehandRuntime,
+    *,
+    page: Any,
+    job_url: str,
+) -> tuple[Any, bool, bool, str]:
+    if await _justjoin_logged_in(page):
+        return page, False, False, ""
+
+    auto_sign_in_clicked, auto_sign_in_note = await _attempt_justjoin_sign_in_click(page)
+    credentials_note = ""
+    if auto_sign_in_clicked:
+        try:
+            await sleep_ms(1600)
+            await _log_justjoin_sign_in_surface(page)
+            await _advance_justjoin_sign_in_flow(page)
+            credentials = _justjoin_credentials_from_env()
+            if credentials is not None:
+                login_attempted = await _attempt_justjoin_credentials_login(
+                    page,
+                    email=credentials[0],
+                    password=credentials[1],
+                )
+                if login_attempted:
+                    credentials_note = "I clicked JustJoin sign-in and tried the credentials from env."
+            await sleep_ms(1200)
+            auto_handoff_url = str(getattr(page, "url", "") or "")
+            await runtime.save_storage_state()
+            await runtime.session.navigate(url=job_url, page=page)
+            await accept_cookies(runtime, page)
+            page = await _restore_offer_page_after_cookie_redirect(runtime, page, expected_url=job_url)
+            auto_logged_in = await _justjoin_logged_in(page)
+            _log_apply_event(
+                "JUSTJOIN_PRELOGIN_AUTO_STATE",
+                clicked="true",
+                logged_in=str(auto_logged_in).lower(),
+                handoff_url=auto_handoff_url or "-",
+                page_url=str(getattr(page, "url", "") or ""),
+            )
+            if auto_logged_in:
+                return page, True, False, "JustJoin login completed automatically before opening apply."
+        except Exception as exc:  # noqa: BLE001
+            _log_apply_event("JUSTJOIN_PRELOGIN_AUTO_ERROR", error=str(exc)[:240])
+
+    console.print(
+        Panel(
+            (
+                f"{credentials_note or auto_sign_in_note or 'JustJoin sign-in is visible on the offer page.'} Sign in in the browser now, "
+                "then press Enter here so I can save the session before opening apply."
+            ),
+            title="JustJoin Login",
+            style="yellow",
+        )
+    )
+    if not _stdin_is_interactive():
+        return page, True, True, "JustJoin login is required before apply can continue."
+    try:
+        input()
+    except EOFError:
+        return page, True, True, "JustJoin login is required before apply can continue."
+
+    try:
+        handoff_url = str(getattr(page, "url", "") or "")
+        await runtime.save_storage_state()
+        await sleep_ms(1000)
+        await runtime.session.navigate(url=job_url, page=page)
+        await accept_cookies(runtime, page)
+        page = await _restore_offer_page_after_cookie_redirect(runtime, page, expected_url=job_url)
+        logged_in = await _justjoin_logged_in(page)
+        _log_apply_event(
+            "JUSTJOIN_PRELOGIN_STATE",
+            logged_in=str(logged_in).lower(),
+            handoff_url=handoff_url or "-",
+            page_url=str(getattr(page, "url", "") or ""),
+        )
+        if not logged_in:
+            return page, True, True, "JustJoin login was not detected on the offer page after handoff."
+        return page, True, False, "JustJoin login completed and session state saved before opening apply."
+    except Exception as exc:  # noqa: BLE001
+        return page, True, True, f"JustJoin pre-login handoff failed: {exc}"
+
+
+async def _attempt_justjoin_sign_in_click(page: Any) -> tuple[bool, str]:
+    clicked, details = await _click_visible_action_by_texts(page, ("sign in", "log in", "zaloguj"))
+    if not clicked:
+        return False, "JustJoin sign-in is visible on the offer page."
+
+    _log_apply_event(
+        "JUSTJOIN_PRELOGIN_AUTO_CLICKED",
+        text=str(details.get("text") or "-")[:120],
+        href=str(details.get("href") or "-")[:240],
+        index=str(details.get("index") or "-"),
+        page_url=str(getattr(page, "url", "") or ""),
+    )
+    return True, "I clicked the visible JustJoin sign-in action, but the session still needs confirmation."
+
+
+async def _advance_justjoin_sign_in_flow(page: Any) -> None:
+    steps = (
+        ("sign in to candidate's profile", "candidate’s profile", "candidate profile"),
+        ("sign in using email address", "use email address", "email address"),
+    )
+    for step_index, labels in enumerate(steps, start=1):
+        clicked = False
+        details: dict[str, Any] = {}
+        for attempt in range(1, 4):
+            clicked, details = await _click_visible_action_by_texts(page, labels)
+            if clicked:
+                _log_apply_event(
+                    "JUSTJOIN_PRELOGIN_STEP",
+                    step=str(step_index),
+                    attempt=str(attempt),
+                    clicked="true",
+                    labels=" | ".join(labels),
+                    text=str(details.get("text") or "-")[:120],
+                    href=str(details.get("href") or "-")[:240],
+                    index=str(details.get("index") or "-"),
+                    page_url=str(getattr(page, "url", "") or ""),
+                )
+                await sleep_ms(1200)
+                break
+            if attempt < 3:
+                await sleep_ms(700)
+        if clicked:
+            continue
+        _log_apply_event(
+            "JUSTJOIN_PRELOGIN_STEP",
+            step=str(step_index),
+            attempt="3",
+            clicked="false",
+            labels=" | ".join(labels),
+            text=str(details.get("text") or "-")[:120],
+            href=str(details.get("href") or "-")[:240],
+            index=str(details.get("index") or "-"),
+            page_url=str(getattr(page, "url", "") or ""),
+        )
+
+
+async def _log_justjoin_sign_in_surface(page: Any) -> None:
+    try:
+        context = page.context
+        pages = context.pages
+    except Exception:
+        pages = [page]
+
+    summaries: list[str] = []
+    for idx, candidate in enumerate(pages[:5]):
+        try:
+            current_url = str(getattr(candidate, "url", "") or "")
+        except Exception:
+            current_url = ""
+        try:
+            title = str(await candidate.title())
+        except Exception:
+            title = ""
+        summaries.append(f"{idx}:{title[:40] or '-'}::{current_url[:120] or '-'}")
+
+    _log_apply_event(
+        "JUSTJOIN_SIGNIN_SURFACE",
+        page_count=str(len(pages)),
+        pages=" || ".join(summaries)[:500] or "-",
+        page_url=str(getattr(page, "url", "") or ""),
+    )
+
+
+async def _click_visible_action_by_texts(page: Any, labels: tuple[str, ...]) -> tuple[bool, dict[str, Any]]:
+    normalized_labels = [label.strip().lower() for label in labels if label.strip()]
+    locator = page.locator("a, button, [role='button'], [role='menuitem']")
+    try:
+        count = await locator.count()
+    except Exception as exc:  # noqa: BLE001
+        _log_apply_event("JUSTJOIN_ACTION_CLICK_FAILED", error=str(exc)[:240], stage="count")
+        return False, {}
+
+    candidates: list[dict[str, Any]] = []
+    for index in range(min(count, 250)):
+        candidate = locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            text = str((await candidate.inner_text()) or "").strip()
+            if not text:
+                text = str((await candidate.get_attribute("aria-label")) or "").strip()
+            normalized = text.lower()
+            href = str((await candidate.get_attribute("href")) or "").strip()
+            candidates.append(
+                {
+                    "locator": candidate,
+                    "text": text,
+                    "normalized": normalized,
+                    "href": href,
+                    "index": index,
+                }
+            )
+        except Exception:
+            continue
+
+    for mode in ("exact", "contains"):
+        for meta in candidates:
+            normalized = str(meta["normalized"])
+            if mode == "exact":
+                if normalized not in normalized_labels:
+                    continue
+            else:
+                if not any(label in normalized for label in normalized_labels):
+                    continue
+            try:
+                locator_handle = meta["locator"]
+                await locator_handle.scroll_into_view_if_needed(timeout=2000)
+                try:
+                    await locator_handle.click(timeout=5000)
+                except Exception:
+                    await locator_handle.click(timeout=5000, force=True)
+            except Exception as exc:  # noqa: BLE001
+                _log_apply_event(
+                    "JUSTJOIN_ACTION_CLICK_FAILED",
+                    error=str(exc)[:240],
+                    index=str(meta["index"]),
+                    labels=" | ".join(labels),
+                    mode=mode,
+                )
+                return False, {}
+
+            return True, {"text": meta["text"], "href": meta["href"], "index": meta["index"], "mode": mode}
+
+    return False, {}
+
+
+def _justjoin_credentials_from_env() -> tuple[str, str] | None:
+    email = str(os.getenv("JUSTJOIN_EMAIL") or "").strip()
+    password = str(os.getenv("JUSTJOIN_PASSWORD") or "").strip()
+    if email and password:
+        return email, password
+    return None
+
+
+async def _attempt_justjoin_credentials_login(page: Any, *, email: str, password: str) -> bool:
+    last_result: dict[str, Any] = {}
+    for attempt in range(1, 6):
+        try:
+            result = await page.evaluate(
+                """({ email, password }) => {
+                    const visible = (el) => {
+                      if (!el) return false;
+                      const style = window.getComputedStyle(el);
+                      if (style.visibility === "hidden" || style.display === "none") return false;
+                      const rect = el.getBoundingClientRect();
+                      return rect.width > 0 && rect.height > 0;
+                    };
+                    const inputs = Array.from(document.querySelectorAll('input'));
+                    const passwordInput = inputs.find((el) =>
+                      visible(el) && (
+                        (el.getAttribute('type') || '').toLowerCase() === 'password' ||
+                        ((el.getAttribute('autocomplete') || '').toLowerCase().includes('password'))
+                      )
+                    );
+                    const emailInput = inputs.find((el) => {
+                      if (!visible(el) || el === passwordInput) return false;
+                      const type = (el.getAttribute('type') || '').toLowerCase();
+                      const auto = (el.getAttribute('autocomplete') || '').toLowerCase();
+                      const name = (el.getAttribute('name') || '').toLowerCase();
+                      const id = (el.getAttribute('id') || '').toLowerCase();
+                      const placeholder = (el.getAttribute('placeholder') || '').toLowerCase();
+                      const label = (el.closest('label')?.innerText || '').toLowerCase();
+                      return (
+                        type === 'email' ||
+                        auto.includes('email') ||
+                        auto.includes('username') ||
+                        name.includes('email') ||
+                        name.includes('login') ||
+                        id.includes('email') ||
+                        id.includes('login') ||
+                        placeholder.includes('email') ||
+                        placeholder.includes('login') ||
+                        label.includes('email')
+                      );
+                    });
+
+                    const inputEvent = new Event('input', { bubbles: true });
+                    const changeEvent = new Event('change', { bubbles: true });
+                    const buttons = Array.from(document.querySelectorAll('button, [role="button"], input[type="submit"]'));
+                    const continueButton = buttons.find((el) => {
+                      if (!visible(el)) return false;
+                      const text = ((el.textContent || el.getAttribute('value') || el.getAttribute('aria-label') || '')).trim().toLowerCase();
+                      return (
+                        text === 'continue' ||
+                        text === 'next' ||
+                        text === 'dalej' ||
+                        text === 'sign in' ||
+                        text === 'log in' ||
+                        text === 'zaloguj'
+                      );
+                    });
+
+                    if (!emailInput && !passwordInput) {
+                      return { attempted: false, reason: 'no_auth_inputs' };
+                    }
+
+                    if (emailInput && !passwordInput) {
+                      emailInput.focus();
+                      emailInput.value = email;
+                      emailInput.dispatchEvent(inputEvent);
+                      emailInput.dispatchEvent(changeEvent);
+                      if (continueButton) {
+                        continueButton.click();
+                        return { attempted: true, reason: 'email_only_step', submitted: 'continue' };
+                      }
+                      return { attempted: true, reason: 'email_only_step', submitted: 'filled_only' };
+                    }
+
+                    if (!emailInput && passwordInput) {
+                      passwordInput.focus();
+                      passwordInput.value = password;
+                      passwordInput.dispatchEvent(inputEvent);
+                      passwordInput.dispatchEvent(changeEvent);
+                      if (continueButton) {
+                        continueButton.click();
+                        return { attempted: true, reason: 'password_only_step', submitted: 'continue' };
+                      }
+                      return { attempted: true, reason: 'password_only_step', submitted: 'filled_only' };
+                    }
+
+                    emailInput.focus();
+                    emailInput.value = email;
+                    emailInput.dispatchEvent(inputEvent);
+                    emailInput.dispatchEvent(changeEvent);
+                    passwordInput.focus();
+                    passwordInput.value = password;
+                    passwordInput.dispatchEvent(inputEvent);
+                    passwordInput.dispatchEvent(changeEvent);
+
+                    const form = passwordInput.form || emailInput.form;
+                    if (form) {
+                      const submitter = form.querySelector('button[type="submit"], input[type="submit"]');
+                      if (submitter && visible(submitter)) {
+                        submitter.click();
+                        return { attempted: true, reason: 'email_and_password', submitted: 'button' };
+                      }
+                      if (typeof form.requestSubmit === 'function') {
+                        form.requestSubmit();
+                        return { attempted: true, reason: 'email_and_password', submitted: 'requestSubmit' };
+                      }
+                      form.submit();
+                      return { attempted: true, reason: 'email_and_password', submitted: 'submit' };
+                    }
+
+                    if (continueButton) {
+                      continueButton.click();
+                      return { attempted: true, reason: 'email_and_password', submitted: 'continue' };
+                    }
+
+                    return { attempted: true, reason: 'email_and_password', submitted: 'filled_only' };
+                }""",
+                {"email": email, "password": password},
+            )
+        except Exception as exc:  # noqa: BLE001
+            _log_apply_event("JUSTJOIN_CREDENTIAL_LOGIN_ERROR", error=str(exc)[:240], attempt=str(attempt))
+            return False
+
+        last_result = dict(result or {})
+        attempted = bool(last_result.get("attempted"))
+        _log_apply_event(
+            "JUSTJOIN_CREDENTIAL_LOGIN_ATTEMPT",
+            attempt=str(attempt),
+            attempted=str(attempted).lower(),
+            reason=str(last_result.get("reason") or "-")[:120],
+            submitted=str(last_result.get("submitted") or "-")[:120],
+            page_url=str(getattr(page, "url", "") or ""),
+        )
+        if attempted and str(last_result.get("reason") or "") not in {"no_auth_inputs", "email_only_step"}:
+            return True
+        if attempt < 5:
+            await sleep_ms(700)
+
+    return bool(last_result.get("attempted"))
+
+
+async def _handle_justjoin_login_handoff(
+    runtime: StagehandRuntime,
+    *,
+    page: Any,
+    apply_url: str,
+    job_url: str,
+    field_snapshot: list[dict[str, Any]],
+) -> tuple[Any, str, list[dict[str, Any]], bool, bool, str]:
+    if not await _justjoin_guest_apply_detected(page, field_snapshot):
+        return page, apply_url, field_snapshot, False, False, ""
+
+    console.print(
+        Panel(
+            (
+                "JustJoin appears to be using the guest account-creation flow. "
+                "Sign in in the browser now, then press Enter here so I can save the session and reopen apply."
+            ),
+            title="JustJoin Login",
+            style="yellow",
+        )
+    )
+    if not _stdin_is_interactive():
+        return page, apply_url, field_snapshot, True, True, "JustJoin login is required before apply can continue."
+    try:
+        input()
+    except EOFError:
+        return page, apply_url, field_snapshot, True, True, "JustJoin login is required before apply can continue."
+
+    try:
+        handoff_url = str(getattr(page, "url", "") or "")
+        await runtime.save_storage_state()
+        await sleep_ms(1000)
+        await runtime.session.navigate(url=job_url, page=page)
+        await accept_cookies(runtime, page)
+        page = await _restore_offer_page_after_cookie_redirect(runtime, page, expected_url=job_url)
+        logged_in = await _justjoin_logged_in(page)
+        _log_apply_event(
+            "JUSTJOIN_LOGIN_STATE",
+            logged_in=str(logged_in).lower(),
+            handoff_url=handoff_url or "-",
+            page_url=str(getattr(page, "url", "") or ""),
+        )
+        if not logged_in:
+            return (
+                page,
+                apply_url,
+                field_snapshot,
+                True,
+                True,
+                "JustJoin login was not detected after handoff on the reopened offer page.",
+            )
+        reopened_page, reopened_url, reopened_note = await _open_apply_flow(runtime, page)
+        if reopened_page is None:
+            return page, apply_url, field_snapshot, True, True, reopened_note or "Could not reopen JustJoin apply after login."
+        reopened_fields = await _collect_form_fields(reopened_page)
+        if await _justjoin_guest_apply_detected(reopened_page, reopened_fields):
+            return (
+                reopened_page,
+                reopened_url or apply_url,
+                reopened_fields,
+                True,
+                True,
+                "JustJoin login completed, but the reopened apply flow still looks like guest account creation.",
+            )
+        return (
+            reopened_page,
+            reopened_url or apply_url,
+            reopened_fields,
+            True,
+            False,
+            "JustJoin login completed and session state saved.",
+        )
+    except Exception as exc:  # noqa: BLE001
+        return page, apply_url, field_snapshot, True, True, f"JustJoin login handoff failed: {exc}"
+
+
+async def _justjoin_guest_apply_detected(page: Any, field_snapshot: list[dict[str, Any]]) -> bool:
+    labels = " ".join(str(item.get("label") or "").lower() for item in field_snapshot)
+    names = {str(item.get("name") or "").strip().lower() for item in field_snapshot}
+    if "create_account_accepted" in names:
+        return True
+    if "creating an account" in labels:
+        return True
+    return await _page_has_visible_sign_in(page)
+
+
+async def _justjoin_logged_in(page: Any) -> bool:
+    return not await _page_has_visible_sign_in(page)
+
+
+async def _page_has_visible_sign_in(page: Any) -> bool:
+    try:
+        return bool(
+            await page.evaluate(
+                """() => {
+                    const visible = (el) => {
+                      const style = window.getComputedStyle(el);
+                      if (style.visibility === "hidden" || style.display === "none") return false;
+                      const rect = el.getBoundingClientRect();
+                      return rect.width > 0 && rect.height > 0;
+                    };
+                    const nodes = Array.from(document.querySelectorAll('a, button, [role="button"]'));
+                    return nodes.some((el) => {
+                      if (!visible(el)) return false;
+                      const text = ((el.textContent || el.getAttribute('aria-label') || '')).trim().toLowerCase();
+                      return text === 'sign in' || text === 'log in' || text === 'zaloguj';
+                    });
+                }"""
+            )
+        )
+    except Exception:
+        return False
+
+
 async def _page_requires_login(page: Any) -> bool:
     try:
         snapshot = await page.evaluate(
             """(markers) => {
+                const modalRoot = () => {
+                  const candidates = Array.from(document.querySelectorAll(
+                    '[role="dialog"], [aria-modal="true"], dialog, [data-state="open"]'
+                  ));
+                  const visibleCandidate = candidates.find((el) => {
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === "hidden" || style.display === "none") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  });
+                  return visibleCandidate || document;
+                };
                 const bodyText = (document.body?.innerText || "").toLowerCase();
                 const hasPassword = !!document.querySelector('input[type="password"]');
                 const markerHit = markers.some((marker) => bodyText.includes(marker));
-                return { hasPassword, markerHit, title: (document.title || "").toLowerCase() };
+                const visible = (el) => {
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === "hidden" || style.display === "none") return false;
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const root = modalRoot();
+                const fields = Array.from(root.querySelectorAll('input, textarea, select'))
+                  .filter((el) => visible(el))
+                  .map((el) => {
+                    const parts = [
+                      el.getAttribute('name') || '',
+                      el.getAttribute('id') || '',
+                      el.getAttribute('placeholder') || '',
+                      el.getAttribute('aria-label') || '',
+                      el.getAttribute('autocomplete') || '',
+                      el.getAttribute('accept') || '',
+                      el.closest('label')?.innerText || '',
+                    ];
+                    return `${(el.tagName || '').toLowerCase()} ${(el.getAttribute('type') || '').toLowerCase()} ${parts.join(' ')}`.toLowerCase();
+                  });
+                const applyFieldCount = fields.filter((value) =>
+                  value.includes('email') ||
+                  value.includes('first and last name') ||
+                  value.includes('full name') ||
+                  value.includes('resume') ||
+                  value.includes('cv') ||
+                  value.includes('document') ||
+                  value.includes('upload')
+                ).length;
+                return {
+                  hasPassword,
+                  markerHit,
+                  title: (document.title || "").toLowerCase(),
+                  applyFieldCount,
+                };
             }""",
             list(LOGIN_TEXT_MARKERS),
         )
     except Exception:
         return False
 
+    if bool(snapshot.get("hasPassword")):
+        return True
+
+    if int(snapshot.get("applyFieldCount") or 0) >= 2:
+        return False
+
     title = str(snapshot.get("title") or "")
-    return bool(snapshot.get("hasPassword")) or bool(snapshot.get("markerHit")) or any(
+    return bool(snapshot.get("markerHit")) or any(
         marker in title for marker in LOGIN_TEXT_MARKERS
     )
+
+
+async def _page_has_apply_form(page: Any) -> bool:
+    try:
+        snapshot = await page.evaluate(
+            """() => {
+                const modalRoot = () => {
+                  const candidates = Array.from(document.querySelectorAll(
+                    '[role="dialog"], [aria-modal="true"], dialog, [data-state="open"]'
+                  ));
+                  const visibleCandidate = candidates.find((el) => {
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === "hidden" || style.display === "none") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  });
+                  return visibleCandidate || document;
+                };
+                const visible = (el) => {
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === "hidden" || style.display === "none") return false;
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const root = modalRoot();
+                const nodes = Array.from(root.querySelectorAll('input, textarea, select'))
+                  .filter((el) => visible(el))
+                  .map((el) => {
+                    const parts = [
+                      el.getAttribute('name') || '',
+                      el.getAttribute('id') || '',
+                      el.getAttribute('placeholder') || '',
+                      el.getAttribute('aria-label') || '',
+                      el.getAttribute('autocomplete') || '',
+                      el.getAttribute('accept') || '',
+                      el.closest('label')?.innerText || '',
+                    ];
+                    return `${(el.tagName || '').toLowerCase()} ${(el.getAttribute('type') || '').toLowerCase()} ${parts.join(' ')}`.toLowerCase();
+                  });
+                const applyFieldCount = nodes.filter((value) =>
+                  value.includes('email') ||
+                  value.includes('first and last name') ||
+                  value.includes('full name') ||
+                  value.includes('resume') ||
+                  value.includes('cv') ||
+                  value.includes('document') ||
+                  value.includes('upload')
+                ).length;
+                return { applyFieldCount };
+            }"""
+        )
+    except Exception:
+        return False
+    return int(snapshot.get("applyFieldCount") or 0) >= 2
 
 
 @dataclass
 class FillResult:
     filled_fields: list[str] = field(default_factory=list)
+    semantic_answers: list[str] = field(default_factory=list)
     cv_uploaded: bool = False
     cover_letter_inserted: bool = False
     skipped_fields: list[str] = field(default_factory=list)
@@ -821,6 +1696,8 @@ class FillResult:
         parts: list[str] = []
         if self.filled_fields:
             parts.append(f"Filled: {', '.join(self.filled_fields[:6])}")
+        if self.semantic_answers:
+            parts.append(f"Answered: {', '.join(self.semantic_answers[:6])}")
         if self.cv_uploaded:
             parts.append("CV uploaded")
         if self.cover_letter_inserted:
@@ -834,6 +1711,18 @@ async def _collect_form_fields(page: Any) -> list[dict[str, Any]]:
     try:
         payload = await page.evaluate(
             """() => {
+                const modalRoot = () => {
+                  const candidates = Array.from(document.querySelectorAll(
+                    '[role="dialog"], [aria-modal="true"], dialog, [data-state="open"]'
+                  ));
+                  const visibleCandidate = candidates.find((el) => {
+                    const style = window.getComputedStyle(el);
+                    if (style.visibility === "hidden" || style.display === "none") return false;
+                    const rect = el.getBoundingClientRect();
+                    return rect.width > 0 && rect.height > 0;
+                  });
+                  return visibleCandidate || document;
+                };
                 const visible = (el) => {
                   const style = window.getComputedStyle(el);
                   if (style.visibility === "hidden" || style.display === "none") return false;
@@ -850,7 +1739,8 @@ async def _collect_form_fields(page: Any) -> list[dict[str, Any]]:
                   if (wrapped) return wrapped.innerText.trim();
                   return "";
                 };
-                const nodes = Array.from(document.querySelectorAll('input, textarea, select'));
+                const root = modalRoot();
+                const nodes = Array.from(root.querySelectorAll('input, textarea, select'));
                 let index = 0;
                 return nodes
                   .filter((el) => visible(el))
@@ -875,6 +1765,7 @@ async def _collect_form_fields(page: Any) -> list[dict[str, Any]]:
                       label: labelFor(el),
                       accept: (el.getAttribute('accept') || '').trim(),
                       required: el.required || el.getAttribute('aria-required') === 'true',
+                      checked: !!el.checked,
                       options,
                     };
                     index += 1;
@@ -926,14 +1817,15 @@ async def _fill_detected_fields(
 
         value = _field_value(field_type, profile)
         if value is None:
+            semantic_key = _common_answer_key_for_field(field_meta)
             semantic_value = _common_answer_for_field(field_meta, profile.common_answers)
             if semantic_value is None:
                 continue
             try:
                 await _fill_semantic_answer(locator, field_meta, semantic_value)
-                result.filled_fields.append(field_type)
+                result.semantic_answers.append(semantic_key or field_type)
             except Exception:
-                result.skipped_fields.append(field_type)
+                result.skipped_fields.append(semantic_key or field_type)
             continue
 
         try:
@@ -998,15 +1890,37 @@ def _classify_field(field_meta: dict[str, Any]) -> str:
     if field_type == "file" or any(marker in accept for marker in CV_FIELD_MARKERS):
         if any(marker in text or marker in accept for marker in CV_FIELD_MARKERS):
             return "cv_upload"
+    if field_type == "file" and any(marker in text for marker in ("attachment", "document", "upload")):
+        return "cv_upload"
 
     if tag == "textarea" and any(marker in text for marker in COVER_LETTER_MARKERS):
         return "cover_letter"
 
+    if field_type == "checkbox":
+        return "common_answer"
+    if field_type == "radio":
+        return "common_answer"
+
+    if any(pattern in text for pattern in FIELD_PATTERNS["full_name"]):
+        return "full_name"
+    if any(pattern in text for pattern in FIELD_PATTERNS["first_name"]):
+        return "first_name"
+    if any(pattern in text for pattern in FIELD_PATTERNS["last_name"]):
+        return "last_name"
+    if any(pattern in text for pattern in FIELD_PATTERNS["email"]):
+        return "email"
+    if any(pattern in text for pattern in FIELD_PATTERNS["phone"]):
+        return "phone"
+    if any(pattern in text for pattern in FIELD_PATTERNS["location_city"]):
+        return "location_city"
+
     for field_name, patterns in FIELD_PATTERNS.items():
+        if field_name in {"full_name", "first_name", "last_name", "email", "phone", "location_city"}:
+            continue
         if any(pattern in text for pattern in patterns):
             return field_name
 
-    if tag in {"select"} or field_type in {"radio", "checkbox"}:
+    if tag in {"select"}:
         return "common_answer"
     return ""
 
@@ -1027,14 +1941,23 @@ def _field_value(field_type: str, profile: CandidateApplicationProfile) -> str |
     return value if isinstance(value, str) and value.strip() else None
 
 
-def _common_answer_for_field(field_meta: dict[str, Any], common_answers: dict[str, Any]) -> Any:
+def _common_answer_key_for_field(field_meta: dict[str, Any]) -> str | None:
     text = " ".join(
         str(field_meta.get(key) or "").lower()
         for key in ("label", "placeholder", "name", "id", "ariaLabel")
     )
     for semantic_key, patterns in COMMON_ANSWER_PATTERNS.items():
         if any(pattern in text for pattern in patterns):
-            return common_answers.get(semantic_key)
+            return semantic_key
+    return None
+
+
+def _common_answer_for_field(field_meta: dict[str, Any], common_answers: dict[str, Any]) -> Any:
+    semantic_key = _common_answer_key_for_field(field_meta)
+    if semantic_key:
+        if semantic_key == "required_consent":
+            return True
+        return common_answers.get(semantic_key)
     return None
 
 
