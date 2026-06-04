@@ -29,41 +29,53 @@ from .url_discovery import accept_cookies, dismiss_pracuj_popups
 console = Console()
 
 APPLICATION_STATUS_NEW = "New"
-APPLICATION_STATUS_READY = "Ready"
 APPLICATION_STATUS_APPROVED = "Approved"
-APPLICATION_STATUS_IN_PROGRESS = "In Progress"
-APPLICATION_STATUS_NEEDS_REVIEW = "Needs Review"
+APPLICATION_STATUS_HUMAN_NEEDED = "Human Needed"
 APPLICATION_STATUS_APPLIED = "Applied"
 APPLICATION_STATUS_FAILED = "Failed"
-APPLICATION_STATUS_SKIPPED = "Skipped"
+APPLICATION_STATUS_CLOSED = "Closed"
+
+LEGACY_APPLICATION_STATUS_READY = "Ready"
+LEGACY_APPLICATION_STATUS_IN_PROGRESS = "In Progress"
+LEGACY_APPLICATION_STATUS_NEEDS_REVIEW = "Needs Review"
+LEGACY_APPLICATION_STATUS_SKIPPED = "Skipped"
+
+APPLICATION_NEXT_ACTION_FINAL_SUBMIT = "Final submit"
+APPLICATION_NEXT_ACTION_COMPLETE_LOGIN = "Complete login"
+APPLICATION_NEXT_ACTION_CONTINUE_EXTERNAL_FORM = "Continue external form"
+APPLICATION_NEXT_ACTION_VERIFY_APPLICATION_STATE = "Verify application state"
+APPLICATION_NEXT_ACTION_INVESTIGATE_FORM = "Investigate form"
 
 ALL_APPLICATION_STATUSES = {
     APPLICATION_STATUS_NEW,
-    APPLICATION_STATUS_READY,
     APPLICATION_STATUS_APPROVED,
-    APPLICATION_STATUS_IN_PROGRESS,
-    APPLICATION_STATUS_NEEDS_REVIEW,
+    APPLICATION_STATUS_HUMAN_NEEDED,
     APPLICATION_STATUS_APPLIED,
     APPLICATION_STATUS_FAILED,
-    APPLICATION_STATUS_SKIPPED,
+    APPLICATION_STATUS_CLOSED,
+    LEGACY_APPLICATION_STATUS_READY,
+    LEGACY_APPLICATION_STATUS_IN_PROGRESS,
+    LEGACY_APPLICATION_STATUS_NEEDS_REVIEW,
+    LEGACY_APPLICATION_STATUS_SKIPPED,
 }
 TOUCHED_APPLICATION_STATUSES = {
-    APPLICATION_STATUS_IN_PROGRESS,
-    APPLICATION_STATUS_NEEDS_REVIEW,
+    APPLICATION_STATUS_HUMAN_NEEDED,
     APPLICATION_STATUS_APPLIED,
     APPLICATION_STATUS_FAILED,
-    APPLICATION_STATUS_SKIPPED,
+    APPLICATION_STATUS_CLOSED,
 }
-ELIGIBLE_RESET_STATUSES = {"", APPLICATION_STATUS_NEW, APPLICATION_STATUS_READY, APPLICATION_STATUS_APPROVED}
+ELIGIBLE_RESET_STATUSES = {"", APPLICATION_STATUS_NEW, APPLICATION_STATUS_APPROVED}
 APPROVABLE_APPLICATION_STATUSES = {
     "",
     APPLICATION_STATUS_NEW,
-    APPLICATION_STATUS_READY,
     APPLICATION_STATUS_APPROVED,
-    APPLICATION_STATUS_IN_PROGRESS,
-    APPLICATION_STATUS_NEEDS_REVIEW,
+    APPLICATION_STATUS_HUMAN_NEEDED,
     APPLICATION_STATUS_FAILED,
-    APPLICATION_STATUS_SKIPPED,
+    APPLICATION_STATUS_CLOSED,
+    LEGACY_APPLICATION_STATUS_READY,
+    LEGACY_APPLICATION_STATUS_IN_PROGRESS,
+    LEGACY_APPLICATION_STATUS_NEEDS_REVIEW,
+    LEGACY_APPLICATION_STATUS_SKIPPED,
 }
 APPLY_SUPPORTED_SOURCES = set(supported_site_names())
 DEFAULT_APPLY_THRESHOLD = 80
@@ -86,6 +98,7 @@ APPLICATION_FIELDS = [
     "MatchedSkills",
     "MissingSkills",
     "ApplicationStatus",
+    "ApplicationNextAction",
     "ApplicationNotes",
     "ApplicationUpdatedAt",
     "ApplicationAttemptedAt",
@@ -95,6 +108,7 @@ APPLICATION_FIELDS = [
 ]
 APPLICATION_FIELD_SPECS = {
     "ApplicationStatus": {"type": "singleLineText"},
+    "ApplicationNextAction": {"type": "singleLineText"},
     "ApplicationNotes": {"type": "multilineText"},
     "ApplicationUpdatedAt": {"type": "singleLineText"},
     "ApplicationAttemptedAt": {"type": "singleLineText"},
@@ -162,14 +176,29 @@ APPLICATION_SUCCESS_TEXT_MARKERS = (
     "aplikacja została wysłana",
 )
 APPLY_CLOSED_TEXT_MARKERS = (
+    "oferta wygasła",
+    "oferta wygasla",
     "zakończył zbieranie zgłoszeń",
     "zakonczył zbieranie zgłoszeń",
     "aktualne oferty pracodawcy",
+    "offer expired",
     "no longer accepting applications",
     "applications are closed",
     "application period has ended",
 )
 CV_FIELD_MARKERS = ("cv", "resume", "résumé", "życiorys")
+CV_ACTION_MARKERS = (
+    "dodaj cv",
+    "upload cv",
+    "add cv",
+    "add resume",
+    "upload resume",
+    "plik cv",
+    "prześlij z urządzenia",
+    "przeslij z urzadzenia",
+    "wybierz cv",
+    "choose cv",
+)
 COVER_LETTER_MARKERS = (
     "cover letter",
     "motivation",
@@ -239,6 +268,7 @@ class ApplicationAttemptResult:
     record_id: str
     status: str
     note: str
+    next_action: str = ""
     selected_apply_url: str = ""
     login_handoff: bool = False
     cv_uploaded: bool = False
@@ -257,7 +287,7 @@ def _airtable_api(client: AirtableClient) -> Any:
     return Api(client.config.api_key)
 
 
-def get_existing_offer_field_names(client: AirtableClient) -> set[str]:
+def _get_offer_table_metadata(client: AirtableClient) -> dict[str, Any]:
     api = _airtable_api(client)
     base_id = client.config.base_id
     table_id = client.config.offers_table_id
@@ -265,14 +295,90 @@ def get_existing_offer_field_names(client: AirtableClient) -> set[str]:
     table = next((item for item in response.get("tables", []) if item.get("id") == table_id), None)
     if not table:
         raise RuntimeError(f"Could not find Airtable offers table {table_id} in base {base_id}.")
+    return table
+
+
+def get_existing_offer_field_names(client: AirtableClient) -> set[str]:
+    table = _get_offer_table_metadata(client)
     return {str(field.get("name") or "").strip() for field in table.get("fields", []) if field.get("name")}
 
 
+def _ensure_application_status_choice(client: AirtableClient, table_metadata: dict[str, Any], *, dry_run: bool = False) -> dict[str, Any]:
+    status_field = next(
+        (field for field in table_metadata.get("fields", []) if str(field.get("name") or "").strip() == "ApplicationStatus"),
+        None,
+    )
+    if not status_field:
+        return {"updated": False, "missing": True}
+
+    if str(status_field.get("type") or "").strip() != "singleSelect":
+        return {"updated": False, "skipped": "not_single_select"}
+
+    options = status_field.get("options") or {}
+    choices = list(options.get("choices") or [])
+    if any(str(choice.get("name") or "").strip() == APPLICATION_STATUS_HUMAN_NEEDED for choice in choices):
+        return {"updated": False, "existing": True}
+
+    updated_choices = [
+        {
+            "name": str(choice.get("name") or "").strip(),
+            "color": str(choice.get("color") or "").strip() or "grayLight2",
+        }
+        for choice in choices
+        if str(choice.get("name") or "").strip()
+    ]
+    updated_choices.append({"name": APPLICATION_STATUS_HUMAN_NEEDED, "color": "yellowBright"})
+    if dry_run:
+        return {"updated": False, "missing_choice": APPLICATION_STATUS_HUMAN_NEEDED, "dry_run": True}
+
+    api = _airtable_api(client)
+    base_id = client.config.base_id
+    table_id = client.config.offers_table_id
+    field_id = str(status_field.get("id") or "").strip()
+    payload = {
+        "name": "ApplicationStatus",
+        "type": "singleSelect",
+        "options": {
+            "choices": updated_choices,
+        },
+    }
+    api.request(
+        "PATCH",
+        f"https://api.airtable.com/v0/meta/bases/{base_id}/tables/{table_id}/fields/{field_id}",
+        json=payload,
+    )
+    return {"updated": True, "added_choice": APPLICATION_STATUS_HUMAN_NEEDED}
+
+
 def ensure_application_fields(client: AirtableClient, *, dry_run: bool = False) -> dict[str, Any]:
-    existing = get_existing_offer_field_names(client)
+    table = _get_offer_table_metadata(client)
+    existing = {str(field.get("name") or "").strip() for field in table.get("fields", []) if field.get("name")}
     missing = [name for name in APPLICATION_FIELD_SPECS if name not in existing]
+    try:
+        status_sync_result = _ensure_application_status_choice(client, table, dry_run=dry_run)
+    except HTTPError as exc:
+        status_sync_result = {
+            "updated": False,
+            "error": f"Could not sync ApplicationStatus choices automatically: {exc}",
+        }
+    if status_sync_result.get("updated"):
+        console.print(
+            Panel(
+                f"Added Airtable ApplicationStatus option: {APPLICATION_STATUS_HUMAN_NEEDED}",
+                title="Apply Schema",
+                style="green",
+            )
+        )
+    elif status_sync_result.get("error"):
+        console.print(
+            Panel(
+                str(status_sync_result["error"]),
+                title="Apply Schema",
+                style="yellow",
+            )
+        )
     if not missing:
-        return {"created": [], "existing": sorted(existing)}
+        return {"created": [], "existing": sorted(existing), "status_sync": status_sync_result}
 
     if dry_run:
         return {"created": [], "missing": missing, "dry_run": True}
@@ -304,7 +410,7 @@ def ensure_application_fields(client: AirtableClient, *, dry_run: bool = False) 
                 style="green",
             )
         )
-    return {"created": created, "existing": sorted(existing | set(created))}
+    return {"created": created, "existing": sorted(existing | set(created)), "status_sync": status_sync_result}
 
 
 def load_candidate_application_profile(path: str, cv_override: str | None = None) -> CandidateApplicationProfile:
@@ -448,8 +554,14 @@ def _list_automation_processes() -> list[dict[str, Any]]:
             continue
         if pid == current_pid:
             continue
+        lowered_command = command.lower()
+        if "skycomputeruseclient" in lowered_command or "codex computer use.app" in lowered_command:
+            continue
         for kind, marker in AUTOMATION_PROCESS_MARKERS:
             if marker in command:
+                if kind == "apply_run":
+                    if "python" not in lowered_command and ".venv/bin/python" not in lowered_command:
+                        continue
                 processes.append({"pid": pid, "kind": kind, "command": command.strip()})
                 break
     return sorted(processes, key=lambda item: int(item["pid"]))
@@ -632,7 +744,7 @@ async def apply_to_jobs(
     session_state_path: str = DEFAULT_APPLY_SESSION_STATE_PATH,
     source: str | None = None,
 ) -> dict[str, Any]:
-    ensure_application_fields(client, dry_run=dry_run)
+    schema_result = ensure_application_fields(client, dry_run=dry_run)
     records = _fetch_offer_records(client)
     selected = _select_apply_candidates(records, batch_size=batch_size, record_ids=record_ids or [], source=source)
     if dry_run:
@@ -653,11 +765,14 @@ async def apply_to_jobs(
     runtime = await StagehandRuntime.create(session_state_path=session_state_path)
     processed = 0
     active_batch_tag = batch_tag or generate_batch_tag()
+    human_needed_supported = _supports_human_needed_status(schema_result.get("status_sync") or {})
     try:
         for record in selected:
             prepared = _in_progress_update(record_id=record["id"], batch_tag=active_batch_tag)
             client.batch_update_records([prepared])
             result = await _assist_application_for_record(runtime, record, candidate_profile)
+            if result.status == APPLICATION_STATUS_HUMAN_NEEDED and not human_needed_supported:
+                result.status = LEGACY_APPLICATION_STATUS_NEEDS_REVIEW
             client.batch_update_records([_result_to_update(result, batch_tag=active_batch_tag)])
             processed += 1
     finally:
@@ -696,8 +811,9 @@ def _prepare_shortlist_updates(
     for record in selected:
         score = _record_score(record)
         fields = {
-            "ApplicationStatus": APPLICATION_STATUS_READY,
-            "ApplicationNotes": f"Ready for review at score {score}.",
+            "ApplicationStatus": APPLICATION_STATUS_APPROVED,
+            "ApplicationNextAction": "",
+            "ApplicationNotes": f"Approved by shortlist at score {score}.",
             "ApplicationUpdatedAt": now,
         }
         updates.append({"id": record["id"], "fields": fields})
@@ -729,7 +845,7 @@ def _select_shortlist_candidates(
         if score < threshold:
             continue
         status = _application_status(fields)
-        if status not in {"", APPLICATION_STATUS_NEW, APPLICATION_STATUS_READY}:
+        if status not in {"", APPLICATION_STATUS_NEW, LEGACY_APPLICATION_STATUS_READY}:
             continue
         selected.append(record)
     return sorted(selected, key=_queue_sort_key, reverse=True)
@@ -856,6 +972,7 @@ def approve_jobs(
                 "id": record["id"],
                 "fields": {
                     "ApplicationStatus": APPLICATION_STATUS_APPROVED,
+                    "ApplicationNextAction": "",
                     "ApplicationApprovedAt": now,
                     "ApplicationUpdatedAt": now,
                     "ApplicationNotes": "Approved for board-by-board apply test.",
@@ -922,12 +1039,21 @@ def _now_iso() -> str:
     return datetime.now(UTC).isoformat().replace("+00:00", "Z")
 
 
+def _supports_human_needed_status(status_sync_result: dict[str, Any]) -> bool:
+    if status_sync_result.get("updated") or status_sync_result.get("existing"):
+        return True
+    if status_sync_result.get("skipped") == "not_single_select":
+        return True
+    return False
+
+
 def _in_progress_update(record_id: str, batch_tag: str) -> dict[str, Any]:
     now = _now_iso()
     return {
         "id": record_id,
         "fields": {
-            "ApplicationStatus": APPLICATION_STATUS_IN_PROGRESS,
+            "ApplicationStatus": APPLICATION_STATUS_APPROVED,
+            "ApplicationNextAction": "",
             "ApplicationUpdatedAt": now,
             "ApplicationAttemptedAt": now,
             "ApplicationApprovedAt": now,
@@ -943,6 +1069,7 @@ def _result_to_update(result: ApplicationAttemptResult, *, batch_tag: str) -> di
         "id": result.record_id,
         "fields": {
             "ApplicationStatus": result.status,
+            "ApplicationNextAction": result.next_action,
             "ApplicationNotes": _truncate_text(result.note, 420),
             "ApplicationUpdatedAt": now,
             "ApplicationAttemptedAt": now,
@@ -973,6 +1100,14 @@ async def _assist_application_for_record(
     page = await _restore_offer_page_after_cookie_redirect(runtime, page, expected_url=url)
     if source == "pracuj":
         await dismiss_pracuj_popups(page)
+    closed_offer_note = await _detect_closed_apply_state(page)
+    if closed_offer_note:
+        return ApplicationAttemptResult(
+            record_id=record_id,
+            status=APPLICATION_STATUS_CLOSED,
+            note=closed_offer_note,
+            selected_apply_url=str(getattr(page, "url", "") or url),
+        )
 
     try:
         justjoin_login_handoff = False
@@ -985,8 +1120,9 @@ async def _assist_application_for_record(
             if justjoin_login_still_required:
                 return ApplicationAttemptResult(
                     record_id=record_id,
-                    status=APPLICATION_STATUS_NEEDS_REVIEW,
+                    status=APPLICATION_STATUS_HUMAN_NEEDED,
                     note=justjoin_login_note or "JustJoin login is still required before apply can continue safely.",
+                    next_action=APPLICATION_NEXT_ACTION_COMPLETE_LOGIN,
                     selected_apply_url=str(getattr(page, "url", "") or url),
                     login_handoff=justjoin_login_handoff,
                 )
@@ -998,17 +1134,18 @@ async def _assist_application_for_record(
                 note=apply_note or "Could not find the main apply action on the job page.",
             )
 
-        login_handoff, login_still_required = await _handle_login_handoff(apply_page)
+        login_handoff, login_still_required = await _handle_login_handoff(apply_page, source=source)
         if login_still_required:
             return ApplicationAttemptResult(
                 record_id=record_id,
-                status=APPLICATION_STATUS_NEEDS_REVIEW,
+                status=APPLICATION_STATUS_HUMAN_NEEDED,
                 note="Login is still required before the application form can be filled safely.",
+                next_action=APPLICATION_NEXT_ACTION_COMPLETE_LOGIN,
                 selected_apply_url=apply_url,
                 login_handoff=login_handoff,
             )
         recovery_notes: list[str] = []
-        if source == "pracuj" and login_handoff:
+        if source in {"pracuj", "theprotocol"} and login_handoff:
             recovered_page, recovered_url, recovery_note = await _recover_apply_page_after_successful_login(
                 runtime,
                 page=apply_page,
@@ -1018,8 +1155,9 @@ async def _assist_application_for_record(
             if recovered_page is None:
                 return ApplicationAttemptResult(
                     record_id=record_id,
-                    status=APPLICATION_STATUS_NEEDS_REVIEW,
+                    status=APPLICATION_STATUS_HUMAN_NEEDED,
                     note=recovery_note or "Login completed, but I could not reopen the apply flow safely.",
+                    next_action=APPLICATION_NEXT_ACTION_CONTINUE_EXTERNAL_FORM,
                     selected_apply_url=apply_url,
                     login_handoff=login_handoff,
                 )
@@ -1030,7 +1168,7 @@ async def _assist_application_for_record(
         if closed_apply_note:
             return ApplicationAttemptResult(
                 record_id=record_id,
-                status=APPLICATION_STATUS_SKIPPED,
+                status=APPLICATION_STATUS_CLOSED,
                 note=closed_apply_note,
                 selected_apply_url=apply_url,
                 login_handoff=login_handoff,
@@ -1046,8 +1184,9 @@ async def _assist_application_for_record(
         if completion_note:
             return ApplicationAttemptResult(
                 record_id=record_id,
-                status=APPLICATION_STATUS_NEEDS_REVIEW,
+                status=APPLICATION_STATUS_HUMAN_NEEDED,
                 note="; ".join(part for part in (apply_note, *recovery_notes, completion_note) if part).strip(" ;"),
+                next_action=APPLICATION_NEXT_ACTION_VERIFY_APPLICATION_STATE,
                 selected_apply_url=str(getattr(apply_page, "url", "") or apply_url),
                 login_handoff=login_handoff or justjoin_login_handoff,
                 final_submit_withheld=True,
@@ -1070,8 +1209,9 @@ async def _assist_application_for_record(
             if justjoin_login_still_required:
                 return ApplicationAttemptResult(
                     record_id=record_id,
-                    status=APPLICATION_STATUS_NEEDS_REVIEW,
+                    status=APPLICATION_STATUS_HUMAN_NEEDED,
                     note=justjoin_login_note or "JustJoin login is still required before apply can continue safely.",
+                    next_action=APPLICATION_NEXT_ACTION_COMPLETE_LOGIN,
                     selected_apply_url=apply_url,
                     login_handoff=True,
                 )
@@ -1098,15 +1238,16 @@ async def _assist_application_for_record(
         if not field_snapshot:
             return ApplicationAttemptResult(
                 record_id=record_id,
-                status=APPLICATION_STATUS_NEEDS_REVIEW,
+                status=APPLICATION_STATUS_HUMAN_NEEDED,
                 note="Apply page opened, but no fillable fields were detected safely.",
+                next_action=APPLICATION_NEXT_ACTION_INVESTIGATE_FORM,
                 selected_apply_url=apply_url,
                 login_handoff=login_handoff,
             )
 
         cover_letter_draft = _generate_cover_letter_draft(fields, profile)
         fill_result = await _fill_detected_fields(apply_page, field_snapshot, profile, cover_letter_draft)
-        review_status, review_note = _post_fill_review(fields, fill_result)
+        review_status, review_note, review_next_action = _post_fill_review(fields, fill_result)
         final_note = "; ".join(
             part for part in (apply_note, *recovery_notes, fill_result.note, review_note) if part
         ).strip(" ;")
@@ -1114,6 +1255,7 @@ async def _assist_application_for_record(
             record_id=record_id,
             status=review_status,
             note=final_note or "Application assist finished.",
+            next_action=review_next_action,
             selected_apply_url=apply_url,
             login_handoff=login_handoff or justjoin_login_handoff,
             cv_uploaded=fill_result.cv_uploaded,
@@ -1197,7 +1339,8 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
         page_count=len(runtime.context.pages),
     )
 
-    heuristic = await page.evaluate(
+    heuristic = await _evaluate_with_navigation_retry(
+        page,
         """({ applyMarkers, excludeMarkers }) => {
             const normalize = (value) => (value || "").trim().toLowerCase().replace(/\\s+/g, " ");
             const visible = (el) => {
@@ -1218,7 +1361,28 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
               if (excludeMarkers.some((marker) => haystack.includes(marker))) continue;
               el.setAttribute("data-jsb-apply-trigger-index", String(index));
               const rect = el.getBoundingClientRect();
-              const score = (text.length ? 100 : 0) + (href ? 10 : 0);
+              const markerBonus = applyMarkers.reduce((bestBonus, marker) => {
+                if (text === marker) return Math.max(bestBonus, 340);
+                if (text.startsWith(`${marker} `) || text.endsWith(` ${marker}`)) return Math.max(bestBonus, 280);
+                if (text.includes(marker)) return Math.max(bestBonus, 180);
+                if (normalize(href).includes(marker)) return Math.max(bestBonus, 80);
+                return bestBonus;
+              }, 0);
+              const role = normalize(el.getAttribute("role") || "");
+              const area = Math.round(rect.width * rect.height);
+              const headingPenalty = el.querySelector("h1, h2, h3, h4, h5, h6") ? 180 : 0;
+              const textPenalty =
+                text.length > 220 ? 220 :
+                text.length > 140 ? 140 :
+                text.length > 80 ? 70 : 0;
+              const areaPenalty =
+                area > 220000 ? 220 :
+                area > 120000 ? 140 :
+                area > 70000 ? 70 : 0;
+              const compactBonus = area < 35000 ? 60 : area < 70000 ? 25 : 0;
+              const tagBonus = (el.tagName || "").toLowerCase() === "button" ? 40 : role === "button" ? 25 : 0;
+              const hrefBonus = href ? 10 : 0;
+              const score = markerBonus + compactBonus + tagBonus + hrefBonus - headingPenalty - textPenalty - areaPenalty;
               if (!best || score > best.score) {
                 best = {
                   text,
@@ -1406,9 +1570,45 @@ def _log_apply_value(value: Any) -> str:
     return text if text else "-"
 
 
+def _is_execution_context_navigation_error(exc: Exception) -> bool:
+    text = str(exc).lower()
+    return "execution context was destroyed" in text or "most likely because of a navigation" in text
+
+
+async def _evaluate_with_navigation_retry(
+    page: Any,
+    script: str,
+    arg: Any | None = None,
+    *,
+    attempts: int = 3,
+    delay_ms: int = 350,
+) -> Any:
+    last_error: Exception | None = None
+    for attempt in range(1, attempts + 1):
+        try:
+            if arg is None:
+                return await page.evaluate(script)
+            return await page.evaluate(script, arg)
+        except Exception as exc:  # noqa: BLE001
+            last_error = exc
+            if not _is_execution_context_navigation_error(exc) or attempt >= attempts:
+                raise
+            _log_apply_event(
+                "APPLY_EVALUATE_RETRY",
+                attempt=attempt,
+                page_url=str(getattr(page, "url", "") or ""),
+                error=str(exc)[:240],
+            )
+            await sleep_ms(delay_ms)
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("evaluate retry finished without a result")
+
+
 async def _sample_apply_surface(page: Any) -> dict[str, Any]:
     try:
-        snapshot = await page.evaluate(
+        snapshot = await _evaluate_with_navigation_retry(
+            page,
             """() => {
                 const modalRoot = () => {
                   const candidates = Array.from(document.querySelectorAll(
@@ -1497,26 +1697,33 @@ async def _wait_for_apply_surface(
     return None, "", ""
 
 
-async def _handle_login_handoff(page: Any) -> tuple[bool, bool]:
+async def _handle_login_handoff(page: Any, *, source: str = "") -> tuple[bool, bool]:
     if not await _page_requires_login(page):
         return False, False
 
     auto_login_note = ""
     page_url = str(getattr(page, "url", "") or "")
-    if _is_pracuj_login_url(page_url):
-        credentials = _pracuj_credentials_from_env()
-        if credentials is not None:
-            login_attempted = await _attempt_credentials_login(
-                page,
-                email=credentials[0],
-                password=credentials[1],
-                source="pracuj",
-            )
-            if login_attempted:
-                await sleep_ms(1200)
-                if not await _page_requires_login(page):
-                    return True, False
-                auto_login_note = "I reached the Pracuj login page and tried the credentials from env."
+    credentials: tuple[str, str] | None = None
+    login_source = source.strip().lower()
+    source_label = source.strip() or "job board"
+    if login_source == "pracuj":
+        if _is_pracuj_login_url(page_url):
+            credentials = _pracuj_credentials_from_env()
+    elif login_source == "theprotocol":
+        credentials = _theprotocol_credentials_from_env()
+
+    if credentials is not None:
+        login_attempted = await _attempt_credentials_login(
+            page,
+            email=credentials[0],
+            password=credentials[1],
+            source=login_source or "generic",
+        )
+        if login_attempted:
+            await sleep_ms(1200)
+            if not await _page_requires_login(page):
+                return True, False
+            auto_login_note = f"I reached the {source_label} login flow and tried the credentials from env."
 
     console.print(
         Panel(
@@ -1706,7 +1913,7 @@ async def _log_justjoin_sign_in_surface(page: Any) -> None:
 
 async def _click_visible_action_by_texts(page: Any, labels: tuple[str, ...]) -> tuple[bool, dict[str, Any]]:
     normalized_labels = [label.strip().lower() for label in labels if label.strip()]
-    locator = page.locator("a, button, [role='button'], [role='menuitem']")
+    locator = page.locator("a, button, [role='button'], [role='menuitem'], [role='link'], label, [tabindex], div, span")
     try:
         count = await locator.count()
     except Exception as exc:  # noqa: BLE001
@@ -1778,6 +1985,14 @@ def _justjoin_credentials_from_env() -> tuple[str, str] | None:
 def _pracuj_credentials_from_env() -> tuple[str, str] | None:
     email = str(os.getenv("PRACUJ_EMAIL") or "").strip()
     password = str(os.getenv("PRACUJ_PASSWORD") or "").strip()
+    if email and password:
+        return email, password
+    return None
+
+
+def _theprotocol_credentials_from_env() -> tuple[str, str] | None:
+    email = str(os.getenv("THEPROTOCOL_EMAIL") or "").strip()
+    password = str(os.getenv("THEPROTOCOL_PASSWORD") or "").strip()
     if email and password:
         return email, password
     return None
@@ -2145,8 +2360,25 @@ async def _page_requires_login(page: Any) -> bool:
                 ).length;
                 const applyFieldCount = fields.filter((value) =>
                   value.includes('email') ||
+                  value.includes('first name') ||
+                  value.includes('firstname') ||
+                  value.includes('first_name') ||
+                  value.includes('name firstname') ||
+                  value.includes('last name') ||
+                  value.includes('lastname') ||
+                  value.includes('last_name') ||
+                  value.includes('lastName'.toLowerCase()) ||
+                  value.includes('surname') ||
+                  value.includes('phone') ||
+                  value.includes('phone number') ||
+                  value.includes('phone_number') ||
+                  value.includes('phonenumber') ||
                   value.includes('first and last name') ||
                   value.includes('full name') ||
+                  value.includes('imię') ||
+                  value.includes('imie') ||
+                  value.includes('nazwisko') ||
+                  value.includes('telefon') ||
                   value.includes('resume') ||
                   value.includes('cv') ||
                   value.includes('document') ||
@@ -2172,13 +2404,18 @@ async def _page_requires_login(page: Any) -> bool:
     page_url = str(snapshot.get("url") or "")
     title = str(snapshot.get("title") or "")
     auth_field_count = int(snapshot.get("authFieldCount") or 0)
+    apply_field_count = int(snapshot.get("applyFieldCount") or 0)
     if "login." in page_url or "/login" in page_url:
         return True
+
+    # Real apply forms often coexist with generic "sign in/create account" text.
+    # If we already see multiple strong application fields and there is no
+    # password input or explicit login URL, prefer the apply interpretation.
+    if apply_field_count >= 2:
+        return False
+
     if auth_field_count >= 1 and (bool(snapshot.get("markerHit")) or "login" in title or "logowanie" in title):
         return True
-
-    if int(snapshot.get("applyFieldCount") or 0) >= 2:
-        return False
 
     return bool(snapshot.get("markerHit")) or any(
         marker in title for marker in LOGIN_TEXT_MARKERS
@@ -2273,8 +2510,25 @@ async def _page_has_apply_form(page: Any) -> bool:
                   });
                 const applyFieldCount = nodes.filter((value) =>
                   value.includes('email') ||
+                  value.includes('first name') ||
+                  value.includes('firstname') ||
+                  value.includes('first_name') ||
+                  value.includes('name firstname') ||
+                  value.includes('last name') ||
+                  value.includes('lastname') ||
+                  value.includes('last_name') ||
+                  value.includes('lastname') ||
+                  value.includes('surname') ||
+                  value.includes('phone') ||
+                  value.includes('phone number') ||
+                  value.includes('phone_number') ||
+                  value.includes('phonenumber') ||
                   value.includes('first and last name') ||
                   value.includes('full name') ||
+                  value.includes('imię') ||
+                  value.includes('imie') ||
+                  value.includes('nazwisko') ||
+                  value.includes('telefon') ||
                   value.includes('resume') ||
                   value.includes('cv') ||
                   value.includes('document') ||
@@ -2427,6 +2681,21 @@ async def _collect_form_fields(page: Any) -> list[dict[str, Any]]:
                   const rect = el.getBoundingClientRect();
                   return rect.width > 0 && rect.height > 0;
                 };
+                const hasCvActionMarker = (text) => {
+                  const normalized = (text || '').toLowerCase();
+                  return (
+                    normalized.includes('dodaj cv') ||
+                    normalized.includes('plik cv') ||
+                    normalized.includes('add cv') ||
+                    normalized.includes('add resume') ||
+                    normalized.includes('upload cv') ||
+                    normalized.includes('upload resume') ||
+                    normalized.includes('prześlij z urządzenia') ||
+                    normalized.includes('przeslij z urzadzenia') ||
+                    normalized.includes('wybierz cv') ||
+                    normalized.includes('choose cv')
+                  );
+                };
                 const labelFor = (el) => {
                   const id = el.id;
                   if (id) {
@@ -2438,9 +2707,23 @@ async def _collect_form_fields(page: Any) -> list[dict[str, Any]]:
                   return "";
                 };
                 const root = modalRoot();
-                const nodes = Array.from(root.querySelectorAll('input, textarea, select'));
+                const inputNodes = Array.from(root.querySelectorAll('input, textarea, select'));
+                const actionNodes = Array.from(
+                  root.querySelectorAll('a, button, [role="button"], [role="link"], label, [tabindex], div, span')
+                )
+                  .filter((el) => visible(el))
+                  .filter((el) => {
+                    const label = (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                    if (!hasCvActionMarker(label)) return false;
+                    return !Array.from(el.querySelectorAll('a, button, [role="button"], [role="link"], label, [tabindex], div, span'))
+                      .filter((child) => child !== el && visible(child))
+                      .some((child) => {
+                        const childLabel = (child.innerText || child.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                        return hasCvActionMarker(childLabel);
+                      });
+                  });
                 let index = 0;
-                return nodes
+                const fields = inputNodes
                   .filter((el) => visible(el))
                   .map((el) => {
                     el.setAttribute('data-jsb-apply-index', String(index));
@@ -2472,6 +2755,61 @@ async def _collect_form_fields(page: Any) -> list[dict[str, Any]]:
                     index += 1;
                     return meta;
                   });
+                const rects = inputNodes
+                  .filter((el) => visible(el))
+                  .map((el) => el.getBoundingClientRect())
+                  .filter((rect) => rect && rect.width > 0 && rect.height > 0);
+                const minTop = rects.length ? Math.min(...rects.map((rect) => rect.top)) : -Infinity;
+                const maxBottom = rects.length ? Math.max(...rects.map((rect) => rect.bottom)) : Infinity;
+                const actions = actionNodes
+                  .filter((el) => {
+                    const rect = el.getBoundingClientRect();
+                    if (!rect || rect.width <= 0 || rect.height <= 0) return false;
+                    return rect.bottom >= (minTop - 250) && rect.top <= (maxBottom + 650);
+                  })
+                  .map((el) => {
+                    const label = (el.innerText || el.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                    const contextText = ((el.parentElement?.innerText || '')).replace(/\\s+/g, ' ').trim().slice(0, 160);
+                    const href = el.tagName.toLowerCase() === 'a' ? (el.getAttribute('href') || el.href || '').trim() : '';
+                    const meta = {
+                      selector: '',
+                      tag: el.tagName.toLowerCase(),
+                      type: 'action',
+                      name: (el.getAttribute('name') || '').trim(),
+                      id: (el.getAttribute('id') || '').trim(),
+                      placeholder: '',
+                      ariaLabel: (el.getAttribute('aria-label') || '').trim(),
+                      autocomplete: '',
+                      inputMode: '',
+                      label,
+                      accept: '',
+                      required: false,
+                      disabled: !!el.disabled,
+                      readOnly: false,
+                      value: '',
+                      checked: false,
+                      options: [],
+                      href,
+                      contextText,
+                    };
+                    return meta;
+                  })
+                  .map((meta) => {
+                    const el = actionNodes.find((candidate) => {
+                      const label = (candidate.innerText || candidate.getAttribute('aria-label') || '').replace(/\\s+/g, ' ').trim();
+                      const href = candidate.tagName.toLowerCase() === 'a' ? (candidate.getAttribute('href') || candidate.href || '').trim() : '';
+                      return label === meta.label && href === meta.href;
+                    });
+                    if (el) {
+                      el.setAttribute('data-jsb-apply-index', String(index));
+                      meta.selector = `[data-jsb-apply-index="${index}"]`;
+                      index += 1;
+                    }
+                    return meta;
+                  })
+                  .filter((meta) => !!meta.selector)
+                  .sort((a, b) => a.label.length - b.label.length);
+                return [...fields, ...actions];
             }"""
         )
     except Exception:
@@ -2501,8 +2839,15 @@ async def _fill_detected_fields(
             continue
 
         if field_type == "cv_upload":
+            if result.cv_uploaded:
+                continue
             try:
-                await locator.set_input_files(str(profile.canonical_cv_path))
+                if str(field_meta.get("type") or "").lower() == "action":
+                    uploaded = await _handle_cv_upload_action(page, locator, profile.canonical_cv_path)
+                    if not uploaded:
+                        raise RuntimeError("CV upload action did not expose a file input.")
+                else:
+                    await locator.set_input_files(str(profile.canonical_cv_path))
                 result.cv_uploaded = True
             except Exception:
                 result.skipped_fields.append("cv_upload")
@@ -2584,10 +2929,12 @@ def _looks_like_company_page(field_snapshot: list[dict[str, Any]], page_url: str
 
 
 def _classify_field(field_meta: dict[str, Any]) -> str:
-    text = " ".join(
+    direct_text = " ".join(
         str(field_meta.get(key) or "").lower()
-        for key in ("label", "placeholder", "name", "id", "ariaLabel", "autocomplete")
+        for key in ("label", "placeholder", "name", "id", "ariaLabel", "autocomplete", "href")
     )
+    context_text = str(field_meta.get("contextText") or "").lower()
+    text = f"{direct_text} {context_text}".strip()
     tag = str(field_meta.get("tag") or "").lower()
     field_type = str(field_meta.get("type") or "").lower()
     accept = str(field_meta.get("accept") or "").lower()
@@ -2605,6 +2952,15 @@ def _classify_field(field_meta: dict[str, Any]) -> str:
         return "phone"
     if autocomplete in {"address-level2", "address-level1"}:
         return "location_city"
+
+    if field_type == "action":
+        if "kreator cv" in direct_text:
+            return ""
+        if any(marker in direct_text for marker in CV_ACTION_MARKERS):
+            return "cv_upload"
+        if not direct_text.strip() and any(marker in context_text for marker in CV_ACTION_MARKERS):
+            return "cv_upload"
+        return ""
 
     if field_type == "file" or any(marker in accept for marker in CV_FIELD_MARKERS):
         if any(marker in text or marker in accept for marker in CV_FIELD_MARKERS):
@@ -2690,18 +3046,111 @@ async def _fill_semantic_answer(locator: Any, field_meta: dict[str, Any], semant
 
     if field_type == "checkbox":
         desired = bool(semantic_value)
-        checked = await locator.is_checked()
-        if desired != checked:
-            await locator.click()
+        try:
+            checked = await locator.is_checked()
+        except Exception:
+            checked = False
+        if desired == checked:
+            return
+        if desired:
+            try:
+                await locator.check(timeout=5000)
+                return
+            except Exception:
+                try:
+                    await locator.click(timeout=5000)
+                    return
+                except Exception:
+                    await locator.click(timeout=5000, force=True)
+                    return
+        try:
+            await locator.uncheck(timeout=5000)
+        except Exception:
+            try:
+                await locator.click(timeout=5000)
+            except Exception:
+                await locator.click(timeout=5000, force=True)
         return
 
     if field_type == "radio":
         desired_label = str(semantic_value).strip().lower()
         if desired_label in {"yes", "true", "1"}:
-            await locator.click()
+            try:
+                await locator.check(timeout=5000)
+            except Exception:
+                try:
+                    await locator.click(timeout=5000)
+                except Exception:
+                    await locator.click(timeout=5000, force=True)
         return
 
     await locator.fill(str(semantic_value))
+
+
+async def _upload_cv_on_page(page: Any, cv_path: Path) -> bool:
+    locator = page.locator('input[type="file"]')
+    try:
+        count = await locator.count()
+    except Exception:
+        return False
+    if count < 1:
+        return False
+    try:
+        await locator.first.set_input_files(str(cv_path))
+        return True
+    except Exception:
+        return False
+
+
+async def _handle_cv_upload_action(page: Any, locator: Any, cv_path: Path) -> bool:
+    before_pages = set(page.context.pages)
+    before_url = str(getattr(page, "url", "") or "")
+    try:
+        await locator.scroll_into_view_if_needed(timeout=2000)
+    except Exception:
+        pass
+    try:
+        await locator.click(timeout=5000)
+    except Exception:
+        try:
+            await locator.click(timeout=5000, force=True)
+        except Exception:
+            return False
+
+    await sleep_ms(1200)
+
+    target_page = page
+    new_pages = [candidate for candidate in page.context.pages if candidate not in before_pages]
+    if new_pages:
+        target_page = new_pages[-1]
+        try:
+            await target_page.bring_to_front()
+        except Exception:
+            pass
+
+    if await _upload_cv_on_page(target_page, cv_path):
+        return True
+
+    clicked, _ = await _click_visible_action_by_texts(
+        target_page,
+        (
+            "prześlij z urządzenia",
+            "przeslij z urzadzenia",
+            "choose from device",
+            "wybierz cv",
+            "dodaj cv",
+        ),
+    )
+    if clicked:
+        await sleep_ms(800)
+        if await _upload_cv_on_page(target_page, cv_path):
+            return True
+
+    current_url = str(getattr(target_page, "url", "") or "")
+    if target_page is page and current_url != before_url:
+        await sleep_ms(800)
+        return await _upload_cv_on_page(target_page, cv_path)
+    return False
 
 
 def _generate_cover_letter_draft(fields: dict[str, Any], profile: CandidateApplicationProfile) -> str:
@@ -2721,20 +3170,21 @@ def _generate_cover_letter_draft(fields: dict[str, Any], profile: CandidateAppli
     )
 
 
-def _post_fill_review(fields: dict[str, Any], fill_result: FillResult) -> tuple[str, str]:
+def _post_fill_review(fields: dict[str, Any], fill_result: FillResult) -> tuple[str, str, str]:
     company = str(fields.get("Company") or "").strip() or "this company"
     position = str(fields.get("Position") or "").strip() or "this role"
     if not _stdin_is_interactive():
         return (
-            APPLICATION_STATUS_NEEDS_REVIEW,
+            APPLICATION_STATUS_HUMAN_NEEDED,
             f"Form filled for {position} at {company}; final submit intentionally withheld.",
+            APPLICATION_NEXT_ACTION_FINAL_SUBMIT,
         )
 
     console.print(
         Panel(
             (
                 f"Review the browser for {position} at {company}.\n"
-                "Type 'applied' if you submitted it manually, 'skip' to mark it skipped, or press Enter to keep Needs Review."
+                "Type 'applied' if you submitted it manually, or press Enter to keep Human Needed."
             ),
             title="Apply Review",
             style="blue",
@@ -2746,12 +3196,17 @@ def _post_fill_review(fields: dict[str, Any], fill_result: FillResult) -> tuple[
         response = ""
 
     if response == "applied":
-        return APPLICATION_STATUS_APPLIED, "Application reviewed and submitted manually."
+        return APPLICATION_STATUS_APPLIED, "Application reviewed and submitted manually.", ""
     if response == "skip":
-        return APPLICATION_STATUS_SKIPPED, "Application intentionally skipped after review."
+        return (
+            APPLICATION_STATUS_HUMAN_NEEDED,
+            "Application was intentionally left without submit during review.",
+            APPLICATION_NEXT_ACTION_INVESTIGATE_FORM,
+        )
     return (
-        APPLICATION_STATUS_NEEDS_REVIEW,
+        APPLICATION_STATUS_HUMAN_NEEDED,
         f"Form prepared ({fill_result.note or 'fields filled'}); final submit intentionally withheld.",
+        APPLICATION_NEXT_ACTION_FINAL_SUBMIT,
     )
 
 
