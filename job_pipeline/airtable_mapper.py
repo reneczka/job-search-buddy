@@ -329,7 +329,7 @@ def _normalize_location(value: str, fallback_text: str = "") -> str:
     for segment in re.split(r"[;/|]", cleaned):
         for candidate in _extract_city_candidates(segment):
             if candidate and candidate not in candidates:
-                candidates.append(candidate)
+                candidates.append(_abbreviate_major_city(candidate))
     if not candidates:
         mode = _extract_work_mode(cleaned) or _extract_work_mode(fallback_cleaned)
         return mode
@@ -867,6 +867,57 @@ def _clean_location_part(value: str) -> str:
     if lowered.endswith(("skie", "ckie", "dzkie")) and cleaned == cleaned.lower():
         return ""
     return cleaned
+
+
+def _abbreviate_major_city(value: str) -> str:
+    cleaned = _normalize_scalar(value)
+    if not cleaned:
+        return ""
+
+    canonical = (
+        cleaned.lower()
+        .replace("ą", "a")
+        .replace("ć", "c")
+        .replace("ę", "e")
+        .replace("ł", "l")
+        .replace("ń", "n")
+        .replace("ó", "o")
+        .replace("ś", "s")
+        .replace("ź", "z")
+        .replace("ż", "z")
+    )
+    canonical = re.sub(r"[^a-z0-9]+", " ", canonical)
+    canonical = re.sub(r"\s+", " ", canonical).strip()
+
+    # Use project-specific shorthand for major Polish cities:
+    # first 3 letters uppercased, except Warsaw which stays WAW.
+    major_city_codes = {
+        "warszawa": "WAW",
+        "krakow": "KRA",
+        "gdansk": "GDA",
+        "wroclaw": "WRO",
+        "poznan": "POZ",
+        "lodz": "LOD",
+        "szczecin": "SZC",
+        "bydgoszcz": "BYD",
+        "lublin": "LUB",
+        "katowice": "KAT",
+        "rzeszow": "RZE",
+        "radom": "RAD",
+        "olsztyn": "OLS",
+        "zielona gora": "ZIE",
+        "bialystok": "BIA",
+        "torun": "TOR",
+        "opole": "OPO",
+        "kielce": "KIE",
+        "gliwice": "GLI",
+        "sopot": "SOP",
+        "gdynia": "GDY",
+        "czestochowa": "CZE",
+        "bielsko biala": "BIE",
+        "gorzow wielkopolski": "GOR",
+    }
+    return major_city_codes.get(canonical, cleaned)
 
 
 def _canonical_company_text(value: str) -> str:

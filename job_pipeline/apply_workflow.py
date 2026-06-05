@@ -1438,7 +1438,7 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
     selector = str((heuristic or {}).get("selector") or "").strip()
     if selector:
         try:
-            await page.locator(selector).first.click(timeout=3000)
+            await _click_apply_trigger(page, selector=selector)
             _log_apply_event("APPLY_CTA_HEURISTIC_CLICKED", selector=selector)
         except Exception as exc:
             _log_apply_event("APPLY_CTA_HEURISTIC_CLICK_FAILED", selector=selector, error=str(exc)[:240])
@@ -1454,6 +1454,26 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
     if result_page is not None:
         _log_apply_event("APPLY_MODAL_DETECTED", source="heuristic", result_url=result_url, note=result_note)
         return result_page, result_url, result_note
+
+    if selector:
+        popup_target = await _capture_window_open_target(page, selector=selector)
+        if popup_target:
+            target = urljoin(before_url, popup_target)
+            _log_apply_event("APPLY_CTA_WINDOW_OPEN_TARGET", selector=selector, target=target[:240])
+            await runtime.session.navigate(url=target, page=page)
+            await accept_cookies(runtime, page)
+            result_page, result_url, result_note = await _wait_for_apply_surface(
+                runtime,
+                page,
+                before_url,
+                before_pages,
+                source="window_open",
+                phase="window_open_navigate",
+            )
+            if result_page is not None:
+                _log_apply_event("APPLY_MODAL_DETECTED", source="window_open", result_url=result_url, note=result_note)
+                return result_page, result_url, "Apply action opened via captured window.open target."
+            return page, str(getattr(page, "url", "") or target), "Navigated to captured apply target."
 
     href = str((heuristic or {}).get("href") or "").strip()
     if href and page.url == before_url:
@@ -1540,6 +1560,63 @@ async def _open_apply_flow(runtime: StagehandRuntime, page: Any) -> tuple[Any | 
 
     _log_apply_event("APPLY_MODAL_NOT_DETECTED", page_url=page.url)
     return None, "", "No safe apply action was detected."
+
+
+async def _click_apply_trigger(page: Any, *, selector: str, timeout_ms: int = 4000) -> None:
+    locator = page.locator(selector).first
+    try:
+        await locator.wait_for(state="visible", timeout=timeout_ms)
+    except Exception:
+        pass
+
+    deadline = time.monotonic() + (timeout_ms / 1000)
+    while True:
+        try:
+            disabled = await locator.is_disabled()
+        except Exception:
+            disabled = False
+        if not disabled:
+            break
+        if time.monotonic() >= deadline:
+            break
+        await sleep_ms(250)
+
+    try:
+        await locator.click(timeout=3000)
+    except Exception:
+        await locator.click(timeout=3000, force=True)
+
+
+async def _capture_window_open_target(page: Any, *, selector: str) -> str:
+    try:
+        target = await page.evaluate(
+            """async ({ selector }) => {
+                const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+                const el = document.querySelector(selector);
+                if (!el) return "";
+                const deadline = Date.now() + 5000;
+                while (el.disabled && Date.now() < deadline) {
+                  await sleep(250);
+                }
+                const originalOpen = window.open;
+                let captured = "";
+                window.open = function(url) {
+                  captured = String(url || "");
+                  return null;
+                };
+                try {
+                  el.click();
+                  await sleep(1200);
+                } finally {
+                  window.open = originalOpen;
+                }
+                return captured;
+            }""",
+            {"selector": selector},
+        )
+    except Exception:
+        return ""
+    return str(target or "").strip()
 
 
 async def _select_latest_context_page(runtime: StagehandRuntime, before_pages: set[Any]) -> Any | None:
@@ -1709,6 +1786,8 @@ async def _handle_login_handoff(page: Any, *, source: str = "") -> tuple[bool, b
     if login_source == "pracuj":
         if _is_pracuj_login_url(page_url):
             credentials = _pracuj_credentials_from_env()
+    elif login_source == "bulldogjob":
+        credentials = _bulldogjob_credentials_from_env()
     elif login_source == "theprotocol":
         credentials = _theprotocol_credentials_from_env()
 
@@ -1998,6 +2077,14 @@ def _theprotocol_credentials_from_env() -> tuple[str, str] | None:
     return None
 
 
+def _bulldogjob_credentials_from_env() -> tuple[str, str] | None:
+    email = str(os.getenv("BULLDOGJOB_EMAIL") or "").strip()
+    password = str(os.getenv("BULLDOGJOB_PASSWORD") or "").strip()
+    if email and password:
+        return email, password
+    return None
+
+
 def _is_pracuj_login_url(url: str) -> bool:
     lowered = str(url or "").strip().lower()
     return lowered.startswith("https://login.pracuj.pl/") or "login.pracuj.pl" in lowered
@@ -2069,13 +2156,36 @@ async def _find_visible_auth_control(page: Any, selectors: tuple[str, ...]) -> A
 
 
 async def _find_visible_auth_button(page: Any) -> Any | None:
-    locator = page.locator("button, [role='button'], input[type='submit']")
+    labels = ("dalej", "continue", "next", "sign in", "log in", "zaloguj")
+
+    submit_locator = page.locator("button[type='submit'], input[type='submit']")
+    try:
+        submit_count = await submit_locator.count()
+    except Exception:
+        submit_count = 0
+    submit_fallback = None
+    for index in range(min(submit_count, 12)):
+        candidate = submit_locator.nth(index)
+        try:
+            if not await candidate.is_visible():
+                continue
+            text = str((await candidate.inner_text()) or "").strip().lower()
+            if not text:
+                text = str((await candidate.get_attribute("value")) or (await candidate.get_attribute("aria-label")) or "").strip().lower()
+            if submit_fallback is None:
+                submit_fallback = candidate
+            if text in labels or any(label in text for label in labels):
+                return candidate
+        except Exception:
+            continue
+    if submit_fallback is not None:
+        return submit_fallback
+
+    locator = page.locator("button, [role='button']")
     try:
         count = await locator.count()
     except Exception:
         return None
-    labels = ("dalej", "continue", "next", "sign in", "log in", "zaloguj")
-    fallback = None
     for index in range(min(count, 20)):
         candidate = locator.nth(index)
         try:
@@ -2084,13 +2194,11 @@ async def _find_visible_auth_button(page: Any) -> Any | None:
             text = str((await candidate.inner_text()) or "").strip().lower()
             if not text:
                 text = str((await candidate.get_attribute("value")) or (await candidate.get_attribute("aria-label")) or "").strip().lower()
-            if fallback is None:
-                fallback = candidate
             if text in labels or any(label in text for label in labels):
                 return candidate
         except Exception:
             continue
-    return fallback
+    return None
 
 
 async def _attempt_playwright_auth_step(page: Any, *, email: str, password: str) -> dict[str, Any]:
@@ -2616,6 +2724,12 @@ async def _detect_closed_apply_state(page: Any) -> str:
                   const marker = closedMarkers.find((item) => text.includes(item));
                   if (marker) {
                     return { closed: true, marker, text: text.slice(0, 240) };
+                  }
+                  const expiredOfferPhrase =
+                    (text.includes('oferta pracy') && (text.includes('wygasła') || text.includes('wygasla'))) ||
+                    ((text.includes('job offer') || text.includes('offer')) && text.includes('expired'));
+                  if (expiredOfferPhrase) {
+                    return { closed: true, marker: 'expired-offer-phrase', text: text.slice(0, 240) };
                   }
                 }
                 return { closed: false };
