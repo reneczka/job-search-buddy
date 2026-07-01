@@ -13,10 +13,11 @@ from rich.console import Console
 from rich.panel import Panel
 
 from airtable_client import AirtableClient
-from config import DEFAULT_OPENAI_MODEL
+from config import DEFAULT_OPENAI_MAX_RETRIES, DEFAULT_OPENAI_MODEL, DEFAULT_OPENAI_TIMEOUT
 
 
 console = Console()
+SCORING_FLUSH_CHUNK_SIZE = 10
 
 BASELINE_SCORE = 50
 MATCHED_CORE_WEIGHT = 12
@@ -632,7 +633,7 @@ async def _call_llm(
     client: AsyncOpenAI,
     model: str,
     prompt: str,
-    max_attempts: int = 2,
+    max_attempts: int = DEFAULT_OPENAI_MAX_RETRIES,
 ) -> str:
     last_error: Optional[Exception] = None
     for attempt in range(1, max_attempts + 1):
@@ -773,6 +774,19 @@ def _changed_scoring_fields(record: Dict[str, Any], update_fields: Dict[str, str
     return changed
 
 
+def _flush_scoring_updates(
+    airtable_client: AirtableClient,
+    updates: List[Dict[str, Any]],
+) -> int:
+    if not updates:
+        return 0
+
+    airtable_client.batch_update_records(updates)
+    flushed = len(updates)
+    updates.clear()
+    return flushed
+
+
 async def _score_record_fields(
     profile: CandidateProfile,
     fields: Dict[str, Any],
@@ -817,11 +831,14 @@ async def score_records(
         client = AsyncOpenAI(
             api_key=api_key,
             base_url=os.getenv("OPENAI_API_BASE"),
+            timeout=DEFAULT_OPENAI_TIMEOUT,
+            max_retries=DEFAULT_OPENAI_MAX_RETRIES,
         )
     else:
         console.print(Panel("OPENAI_API_KEY missing - using deterministic scoring only.", title="Scoring", style="yellow"))
 
     updates: List[Dict[str, Any]] = []
+    updated_total = 0
 
     for record_id in record_ids:
         record = airtable_client.get_record(record_id)
@@ -836,12 +853,23 @@ async def score_records(
             console.print(f"[dim]Skipping unchanged scoring row: {record_id}[/]")
             continue
         updates.append({"id": record_id, "fields": changed_fields})
+        if len(updates) >= SCORING_FLUSH_CHUNK_SIZE:
+            updated_total += _flush_scoring_updates(airtable_client, updates)
+            console.print(f"[dim]Persisted scoring progress: {updated_total}/{len(record_ids)}[/]")
 
     if updates:
-        airtable_client.batch_update_records(updates)
+        updated_total += _flush_scoring_updates(airtable_client, updates)
         console.print(
             Panel(
-                f"Updated scoring for {len(updates)} record(s).",
+                f"Updated scoring for {updated_total} record(s).",
+                title="Scoring",
+                style="green",
+            )
+        )
+    elif updated_total:
+        console.print(
+            Panel(
+                f"Updated scoring for {updated_total} record(s).",
                 title="Scoring",
                 style="green",
             )

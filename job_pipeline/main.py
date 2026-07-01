@@ -6,7 +6,7 @@ import asyncio
 from rich.console import Console
 from rich.panel import Panel
 
-from .boards import supported_site_names
+from .boards import supported_site_choices
 from .pipeline import run_pipeline
 
 
@@ -17,7 +17,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="New dry-run job pipeline.")
     parser.add_argument(
         "--site",
-        choices=["all", *supported_site_names()],
+        choices=["all", *supported_site_choices()],
         default="all",
         help="Run one supported board or all supported boards.",
     )

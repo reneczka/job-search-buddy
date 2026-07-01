@@ -12,7 +12,7 @@ from .airtable_mapper import (
     validate_airtable_record,
 )
 from .airtable_sync import write_airtable_records, write_indeed_full_records, write_indeed_url_test_records
-from .boards import selected_boards
+from .boards import board_alias, selected_boards
 from .detail_extraction import extract_job_detail
 from .models import PipelineRunResult
 from .stagehand_session import (
@@ -77,6 +77,7 @@ async def run_pipeline(
             console.print("CACHE_PROBE=disabled")
 
         for board in boards:
+            board_label = board_alias(board.name)
             if remaining_jobs is not None and remaining_jobs <= 0:
                 console.print("DETAIL_LIMIT_TOTAL reached=0 skipping_remaining_boards=true")
                 break
@@ -91,7 +92,7 @@ async def run_pipeline(
             board_retries_used = 0
 
             console.print(
-                f"DISCOVERY_RESULT site={board.name} urls={len(discovery.urls)} "
+                f"DISCOVERY_RESULT site={board_label} urls={len(discovery.urls)} "
                 f"selector={discovery.metadata.selector or '-'} "
                 f"first_offer={discovery.metadata.first_offer_url or '-'}"
             )
@@ -105,12 +106,12 @@ async def run_pipeline(
                 )
             if max_jobs_per_board is not None:
                 console.print(
-                    f"DETAIL_LIMIT site={board.name} selected={len(selected_urls)} "
+                    f"DETAIL_LIMIT site={board_label} selected={len(selected_urls)} "
                     f"discovered={len(discovery.urls)} max_jobs_per_board={max_jobs_per_board}"
                 )
 
             for index, url in enumerate(selected_urls, start=1):
-                console.print(f"DETAIL_PROGRESS site={board.name} index={index}/{len(selected_urls)} url={url}")
+                console.print(f"DETAIL_PROGRESS site={board_label} index={index}/{len(selected_urls)} url={url}")
                 detail = await extract_job_detail(runtime, board.name, url)
                 board_cache_hits += int(bool(detail.raw.get("cache_hit")))
                 board_selector_fallbacks += int(bool(detail.raw.get("selector_fallback_used")))
@@ -121,12 +122,12 @@ async def run_pipeline(
                 skip_record = should_skip_airtable_record(record)
                 if issues:
                     console.print(
-                        f"RECORD_VALIDATION site={board.name} index={index} "
+                        f"RECORD_VALIDATION site={board_label} index={index} "
                         f"status={'skip' if skip_record else 'warn'} "
                         f"issues={' | '.join(issues)}"
                     )
                 if skip_record:
-                    console.print(f"DETAIL_SKIPPED site={board.name} index={index} reason=record_validation")
+                    console.print(f"DETAIL_SKIPPED site={board_label} index={index} reason=record_validation")
                     continue
                 mapped_records.append(record)
                 board_records.append(record)
@@ -140,10 +141,10 @@ async def run_pipeline(
             total_retries_used += board_retries_used
             board_counts.append((board.name, len(discovery.urls), extracted_count))
             console.print(
-                f"BOARD_RESULT site={board.name} discovered={len(discovery.urls)} extracted={extracted_count}"
+                f"BOARD_RESULT site={board_label} discovered={len(discovery.urls)} extracted={extracted_count}"
             )
             console.print(
-                f"BOARD_EXTRACTION_FLAGS site={board.name} cache_hits={board_cache_hits} "
+                f"BOARD_EXTRACTION_FLAGS site={board_label} cache_hits={board_cache_hits} "
                 f"selector_fallbacks={board_selector_fallbacks} "
                 f"retries_attempted={board_retries_attempted} retries_used={board_retries_used}"
             )
@@ -155,7 +156,7 @@ async def run_pipeline(
                 airtable_updated += int(result["updated"])
                 airtable_skipped += int(result["skipped"])
                 console.print(
-                    f"AIRTABLE_WRITE_BOARD site={board.name} created={result['created']} "
+                    f"AIRTABLE_WRITE_BOARD site={board_label} created={result['created']} "
                     f"updated={result['updated']} skipped={result['skipped']} "
                     f"candidates={len(board_deduped_records)}"
                 )
@@ -165,7 +166,7 @@ async def run_pipeline(
         console.print(f"RECORDS_DEDUPED={len(deduped_records)}")
         for site_name, discovered_count, extracted_count in board_counts:
             console.print(
-                f"BOARD_SUMMARY site={site_name} discovered={discovered_count} extracted={extracted_count}"
+                f"BOARD_SUMMARY site={board_alias(site_name)} discovered={discovered_count} extracted={extracted_count}"
             )
         console.print(
             f"EXTRACTION_FLAGS_TOTAL cache_hits={total_cache_hits} "

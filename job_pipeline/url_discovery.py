@@ -18,6 +18,7 @@ from .stagehand_session import (
     scoped_model_options,
     sleep_ms,
 )
+from .boards import board_alias
 
 
 console: Console = shared_console
@@ -1662,7 +1663,7 @@ async def collect_generic_offers(runtime: StagehandRuntime, board: BoardConfig, 
 
 async def discover_job_urls(runtime: StagehandRuntime, board: BoardConfig) -> DiscoveryResult:
     page = runtime.page
-    console.print(f"TARGET={board.name} URL={board.url}")
+    console.print(f"TARGET={board_alias(board.name)} URL={board.url}")
     await runtime.session.navigate(url=board.url, page=page)
     await sleep_ms(1500)
     await accept_cookies(runtime, page)

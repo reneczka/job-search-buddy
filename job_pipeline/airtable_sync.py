@@ -7,6 +7,7 @@ from rich.panel import Panel
 
 from jobscraper.src.airtable_client import AirtableClient, AirtableConfig
 
+from .boards import board_alias
 from .airtable_mapper import dedupe_airtable_records
 
 
@@ -23,7 +24,7 @@ def write_airtable_records(records: list[dict[str, str]]) -> dict[str, object]:
 
 def write_indeed_full_records(records: list[dict[str, str]]) -> dict[str, object]:
     normalized_records = _normalize_records(records, source_name="indeed")
-    return _write_full_records(normalized_records, source_label="Indeed", records_are_normalized=True)
+    return _write_full_records(normalized_records, source_label=board_alias("indeed"), records_are_normalized=True)
 
 
 def write_indeed_url_test_records(records: list[dict[str, str]]) -> dict[str, object]:
@@ -36,7 +37,7 @@ def write_indeed_url_test_records(records: list[dict[str, str]]) -> dict[str, ob
 
     client = build_airtable_client()
     table = client._connect()
-    console.print("[dim]Fetching existing Airtable links for the Indeed URL-only test...[/]")
+    console.print(f"[dim]Fetching existing Airtable links for the {board_alias('indeed')} URL-only test...[/]")
     existing_records = table.all(fields=["Link"])
     existing_links = {
         _dedupe_link(str(record.get("fields", {}).get("Link") or "").strip())
@@ -51,7 +52,7 @@ def write_indeed_url_test_records(records: list[dict[str, str]]) -> dict[str, ob
         dedupe_key = _dedupe_link(link)
         if dedupe_key in existing_links:
             skipped += 1
-            console.print(f"[dim yellow]Skipping duplicate Indeed URL: {link}[/]")
+            console.print(f"[dim yellow]Skipping duplicate {board_alias('indeed')} URL: {link}[/]")
             continue
         existing_links.add(dedupe_key)
         new_records.append(record)
@@ -60,7 +61,7 @@ def write_indeed_url_test_records(records: list[dict[str, str]]) -> dict[str, ob
     style = "green" if created else "yellow"
     console.print(
         Panel(
-            f"Indeed URL-only Airtable test created {len(created)} records and skipped {skipped} duplicates.",
+            f"{board_alias('indeed')} URL-only Airtable test created {len(created)} records and skipped {skipped} duplicates.",
             title="Airtable",
             style=style,
         )
@@ -117,7 +118,7 @@ def _write_full_records(
     console.print(
         Panel(
             (
-                f"{source_label.capitalize()} Airtable write created {len(created_records)} records, "
+                f"{source_label} Airtable write created {len(created_records)} records, "
                 f"updated {len(updated_records)} records, and skipped {skipped} unchanged rows."
             ),
             title="Airtable",

@@ -180,3 +180,10 @@ src/openai-agents
 
 tests/
 tmp.py
+
+
+cv.md
+preferences.json
+
+
+useful-cmd.md

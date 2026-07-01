@@ -21,7 +21,7 @@ from rich.table import Table
 
 from jobscraper.src.airtable_client import AirtableClient, AirtableConfig
 
-from .boards import supported_site_names
+from .boards import board_alias, normalize_site_name, supported_site_names
 from .stagehand_session import StagehandRuntime, sleep_ms
 from .url_discovery import accept_cookies, dismiss_pracuj_popups
 
@@ -141,6 +141,9 @@ APPLY_EXCLUDE_MARKERS = (
     "skopiuj",
     "report",
     "zgłoś",
+    "profil firmy",
+    "company profile",
+    "companies/profiles",
 )
 COOKIE_REDIRECT_URL_MARKERS = (
     "cookie",
@@ -178,6 +181,8 @@ APPLICATION_SUCCESS_TEXT_MARKERS = (
 APPLY_CLOSED_TEXT_MARKERS = (
     "oferta wygasła",
     "oferta wygasla",
+    "oferta zakończona",
+    "oferta zakonczona",
     "zakończył zbieranie zgłoszeń",
     "zakonczył zbieranie zgłoszeń",
     "aktualne oferty pracodawcy",
@@ -829,7 +834,7 @@ def _select_shortlist_candidates(
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     record_id_filter = set(record_ids)
-    normalized_source = (source or "").strip().lower()
+    normalized_source = normalize_site_name(source or "")
     for record in records:
         if record_id_filter and record["id"] not in record_id_filter:
             continue
@@ -860,7 +865,7 @@ def _select_apply_candidates(
 ) -> list[dict[str, Any]]:
     selected: list[dict[str, Any]] = []
     record_id_filter = set(record_ids)
-    normalized_source = (source or "").strip().lower()
+    normalized_source = normalize_site_name(source or "")
     for record in records:
         if record_id_filter and record["id"] not in record_id_filter:
             continue
@@ -886,7 +891,7 @@ def inspect_jobs(
     limit: int = 20,
 ) -> dict[str, Any]:
     records = _fetch_offer_records(client)
-    normalized_source = (source or "").strip().lower()
+    normalized_source = normalize_site_name(source or "")
     filtered: list[dict[str, Any]] = []
     for record in records:
         fields = record.get("fields", {})
@@ -902,7 +907,7 @@ def inspect_jobs(
     if not filtered:
         console.print(
             Panel(
-                f"No supported apply candidates found for source={source or 'all'}.",
+                f"No supported apply candidates found for source={board_alias(source) if source else 'all'}.",
                 title="Apply Inspect",
                 style="yellow",
             )
@@ -912,7 +917,7 @@ def inspect_jobs(
     filtered.sort(key=_queue_sort_key, reverse=True)
     status_counts = Counter(_application_status(record.get("fields", {})) or "(empty)" for record in filtered)
     scored_count = sum(1 for record in filtered if str(record.get("fields", {}).get("Score") or "").strip())
-    label = source or "all supported sources"
+    label = board_alias(source) if source else "all supported sources"
     summary_lines = [
         f"source={label}",
         f"records={len(filtered)}",
@@ -1175,10 +1180,29 @@ async def _assist_application_for_record(
             )
         field_snapshot = await _collect_form_fields(apply_page)
         if not field_snapshot:
-            prelude_advanced, prelude_note = await _advance_apply_prelude(apply_page)
+            apply_page, prelude_advanced, prelude_note = await _advance_apply_prelude(runtime, apply_page)
             if prelude_advanced:
+                apply_url = str(getattr(apply_page, "url", "") or apply_url)
                 if prelude_note:
                     recovery_notes.append(prelude_note)
+                login_handoff, login_still_required = await _handle_login_handoff(apply_page, source=source)
+                if login_still_required:
+                    return ApplicationAttemptResult(
+                        record_id=record_id,
+                        status=APPLICATION_STATUS_HUMAN_NEEDED,
+                        note="; ".join(
+                            part
+                            for part in (
+                                apply_note,
+                                *recovery_notes,
+                                "Login is still required before the application form can be filled safely.",
+                            )
+                            if part
+                        ).strip(" ;"),
+                        next_action=APPLICATION_NEXT_ACTION_COMPLETE_LOGIN,
+                        selected_apply_url=apply_url,
+                        login_handoff=login_handoff,
+                    )
                 field_snapshot = await _collect_form_fields(apply_page)
         completion_note = await _detect_application_completion_state(apply_page)
         if completion_note:
@@ -1781,8 +1805,8 @@ async def _handle_login_handoff(page: Any, *, source: str = "") -> tuple[bool, b
     auto_login_note = ""
     page_url = str(getattr(page, "url", "") or "")
     credentials: tuple[str, str] | None = None
-    login_source = source.strip().lower()
-    source_label = source.strip() or "job board"
+    login_source = normalize_site_name(source or "")
+    source_label = board_alias(source.strip()) or "job board"
     if login_source == "pracuj":
         if _is_pracuj_login_url(page_url):
             credentials = _pracuj_credentials_from_env()
@@ -2023,7 +2047,13 @@ async def _click_visible_action_by_texts(page: Any, labels: tuple[str, ...]) -> 
             continue
 
     for mode in ("exact", "contains"):
-        for meta in candidates:
+        ordered_candidates = candidates
+        if mode == "contains":
+            ordered_candidates = sorted(
+                candidates,
+                key=lambda meta: (len(str(meta.get("normalized") or "")), int(meta.get("index") or 0)),
+            )
+        for meta in ordered_candidates:
             normalized = str(meta["normalized"])
             if mode == "exact":
                 if normalized not in normalized_labels:
@@ -2530,26 +2560,163 @@ async def _page_requires_login(page: Any) -> bool:
     )
 
 
-async def _advance_apply_prelude(page: Any) -> tuple[bool, str]:
-    clicked, details = await _click_visible_action_by_texts(
-        page,
-        (
-            "kontynuuj aplikowanie",
-            "continue application",
-            "continue applying",
-        ),
+async def _advance_apply_prelude(runtime: StagehandRuntime, page: Any) -> tuple[Any, bool, str]:
+    action_sets = (
+        {
+            "labels": (
+                "kontynuuj aplikowanie",
+                "continue application",
+                "continue applying",
+            ),
+            "href_markers": (),
+        },
+        {
+            "labels": (
+                "apply for this job",
+                "apply now",
+            ),
+            "href_markers": ("/apply",),
+        },
+        {
+            "labels": (
+                "apply manually",
+            ),
+            "href_markers": ("/applymanually",),
+        },
+        {
+            "labels": (
+                "sign in with email",
+            ),
+            "href_markers": (),
+        },
     )
-    if not clicked:
-        return False, ""
-    _log_apply_event(
-        "APPLY_PRELUDE_CLICKED",
-        text=str(details.get("text") or "-")[:120],
-        href=str(details.get("href") or "-")[:240],
-        index=str(details.get("index") or "-"),
-        page_url=str(getattr(page, "url", "") or ""),
-    )
-    await sleep_ms(1200)
-    return True, "Advanced the application prelude screen."
+    advanced = False
+    notes: list[str] = []
+    active_page = page
+    for action in action_sets:
+        labels = tuple(action.get("labels") or ())
+        href_markers = tuple(action.get("href_markers") or ())
+        before_pages = set(runtime.context.pages)
+        clicked, details = await _click_visible_apply_prelude_action(
+            active_page,
+            labels=labels,
+            href_markers=href_markers,
+        )
+        if not clicked:
+            continue
+        advanced = True
+        _log_apply_event(
+            "APPLY_PRELUDE_CLICKED",
+            text=str(details.get("text") or "-")[:120],
+            href=str(details.get("href") or "-")[:240],
+            index=str(details.get("index") or "-"),
+            page_url=str(getattr(active_page, "url", "") or ""),
+        )
+        notes.append(str(details.get("text") or labels[0]))
+        await sleep_ms(1500)
+        latest_page = await _select_latest_context_page(runtime, before_pages)
+        if latest_page is not None:
+            active_page = latest_page
+        try:
+            await accept_cookies(runtime, active_page)
+        except Exception:
+            pass
+    if not advanced:
+        return page, False, ""
+    summary = "Advanced the application prelude"
+    if notes:
+        summary = f"{summary} via: {', '.join(notes[:4])}."
+    else:
+        summary = f"{summary}."
+    return active_page, True, summary
+
+
+async def _click_visible_apply_prelude_action(
+    page: Any,
+    *,
+    labels: tuple[str, ...],
+    href_markers: tuple[str, ...] = (),
+) -> tuple[bool, dict[str, Any]]:
+    normalized_labels = [label.strip().lower() for label in labels if label.strip()]
+    normalized_hrefs = [marker.strip().lower() for marker in href_markers if marker.strip()]
+    if not normalized_labels and not normalized_hrefs:
+        return False, {}
+
+    try:
+        match = await page.evaluate(
+            """({ labels, hrefMarkers }) => {
+                const visible = (el) => {
+                  const style = window.getComputedStyle(el);
+                  if (style.visibility === "hidden" || style.display === "none") return false;
+                  const rect = el.getBoundingClientRect();
+                  return rect.width > 0 && rect.height > 0;
+                };
+                const normalize = (value) => (value || "").toLowerCase().replace(/\\s+/g, " ").trim();
+                const nodes = Array.from(document.querySelectorAll(
+                  'a, button, input[type="button"], input[type="submit"], [role="button"], [role="link"]'
+                ));
+                const candidates = nodes
+                  .filter((el) => visible(el))
+                  .map((el, index) => {
+                    const text = normalize(el.innerText || el.textContent || el.value || el.getAttribute("aria-label") || "");
+                    const href = normalize(el.getAttribute("href") || el.href || "");
+                    const exact = labels.some((label) => text === label);
+                    const contains = labels.some((label) => text.includes(label));
+                    const hrefHit = hrefMarkers.some((marker) => href.includes(marker));
+                    if (!exact && !contains && !hrefHit) return null;
+                    el.setAttribute("data-jsb-prelude-index", String(index));
+                    return {
+                      selector: `[data-jsb-prelude-index="${index}"]`,
+                      text,
+                      href,
+                      exact,
+                      contains,
+                      hrefHit,
+                      weight: exact ? 0 : contains ? 1 : 2,
+                      textLength: text.length || 999,
+                    };
+                  })
+                  .filter(Boolean)
+                  .sort((a, b) => {
+                    if (a.weight !== b.weight) return a.weight - b.weight;
+                    if (a.hrefHit !== b.hrefHit) return a.hrefHit ? -1 : 1;
+                    return a.textLength - b.textLength;
+                  });
+                return candidates[0] || null;
+            }""",
+            {"labels": normalized_labels, "hrefMarkers": normalized_hrefs},
+        )
+    except Exception:
+        return False, {}
+    if not isinstance(match, dict):
+        return False, {}
+
+    selector = str(match.get("selector") or "").strip()
+    if not selector:
+        return False, {}
+
+    try:
+        locator = page.locator(selector).first
+        await locator.scroll_into_view_if_needed(timeout=2000)
+        try:
+            await locator.click(timeout=5000)
+        except Exception:
+            await locator.click(timeout=5000, force=True)
+    except Exception as exc:  # noqa: BLE001
+        _log_apply_event(
+            "APPLY_PRELUDE_CLICK_FAILED",
+            error=str(exc)[:240],
+            selector=selector,
+            labels=" | ".join(labels),
+            page_url=str(getattr(page, "url", "") or ""),
+        )
+        return False, {}
+
+    return True, {
+        "text": str(match.get("text") or ""),
+        "href": str(match.get("href") or ""),
+        "mode": "prelude",
+    }
 
 
 async def _detect_application_completion_state(page: Any) -> str:

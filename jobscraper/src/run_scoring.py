@@ -24,7 +24,16 @@ def _sanitize_env_var(name: str) -> None:
 
 def _load_env() -> None:
     load_dotenv(override=True)
+    if not os.getenv("OPENAI_API_KEY") and os.getenv("LLM_API_KEY"):
+        os.environ["OPENAI_API_KEY"] = os.getenv("LLM_API_KEY", "").strip()
+    if not os.getenv("OPENAI_API_BASE") and os.getenv("LLM_API_BASE"):
+        os.environ["OPENAI_API_BASE"] = os.getenv("LLM_API_BASE", "").strip()
+    if not os.getenv("OPENAI_MODEL") and os.getenv("MODEL"):
+        os.environ["OPENAI_MODEL"] = os.getenv("MODEL", "").strip()
     for name in [
+        "LLM_API_KEY",
+        "LLM_API_BASE",
+        "MODEL",
         "OPENAI_API_KEY",
         "OPENAI_API_BASE",
         "OPENAI_API_TYPE",
@@ -119,11 +128,14 @@ async def _run() -> int:
 
     api_key = os.getenv("OPENAI_API_KEY")
     api_base = os.getenv("OPENAI_API_BASE")
+    model_name = (args.model or os.getenv("OPENAI_MODEL") or os.getenv("MODEL") or DEFAULT_OPENAI_MODEL).strip()
     if api_base:
         console.print(Panel(f"OPENAI_API_BASE={api_base}", title="Scoring", style="blue"))
     if api_key:
         key_hint = "sk-or-..." if api_key.startswith("sk-or-") else "sk-..."
         console.print(Panel(f"OPENAI_API_KEY detected ({key_hint})", title="Scoring", style="blue"))
+    if model_name:
+        console.print(Panel(f"MODEL={model_name}", title="Scoring", style="blue"))
 
     airtable_config = AirtableConfig.from_env()
     if not airtable_config.is_configured():
@@ -152,7 +164,7 @@ async def _run() -> int:
         record_ids=record_ids,
         cv_path=args.cv,
         preferences_path=args.preferences,
-        model=args.model,
+        model=model_name,
     )
 
     return 0

@@ -6,7 +6,7 @@ import asyncio
 from rich.console import Console
 from rich.panel import Panel
 
-from .boards import supported_site_names
+from .boards import supported_site_choices
 from .apply_workflow import (
     DEFAULT_APPLY_BATCH_SIZE,
     DEFAULT_APPLY_SESSION_STATE_PATH,
@@ -33,7 +33,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--threshold", type=int, default=DEFAULT_APPLY_THRESHOLD)
     parser.add_argument("--batch-size", type=int, default=DEFAULT_APPLY_BATCH_SIZE)
     parser.add_argument("--limit", type=int, default=20)
-    parser.add_argument("--source", choices=supported_site_names(), default=None)
+    parser.add_argument("--source", choices=supported_site_choices(), default=None)
     parser.add_argument("--record-ids", nargs="*", default=[])
     parser.add_argument("--dry-run", action="store_true")
     parser.add_argument("--candidate-profile", default="candidate_profile.json")

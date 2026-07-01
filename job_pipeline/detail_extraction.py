@@ -10,6 +10,7 @@ from pydantic import BaseModel, Field
 from rich.console import Console
 
 from .detail_cache import get_detail_cache
+from .boards import board_alias
 from .models import JobDetail
 from .stagehand_session import StagehandRuntime, scoped_model_options, sleep_ms
 from .url_discovery import accept_cookies, normalize_page_url
@@ -58,7 +59,7 @@ async def extract_job_detail(runtime: StagehandRuntime, source_name: str, url: s
         _store_detail_cache(first_pass)
         return first_pass
 
-    console.print(f"DETAIL_RETRY site={source_name} reason=broken_first_pass url={url}")
+    console.print(f"DETAIL_RETRY site={board_alias(source_name)} reason=broken_first_pass url={url}")
     try:
         retry_pass = await _extract_job_detail_once(runtime, source_name, url, force_new_page=True)
     except Exception as exc:
